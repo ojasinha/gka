@@ -94,20 +94,31 @@ Full tables are in [`results/results.md`](results/results.md). Plots are in `res
 
 ![Final validation loss against KV-cache size](results/figures/quality_vs_cache.png)
 
-### Quality (single seed, 40M tokens, ~48M params)
+### Quality (40M tokens, ~48M params)
 
-| Method | KV cache vs GQA | Val loss ↓ | Val PPL | 6-task avg acc | Extrapolation: loss @2048 ctx ↓ |
-|---|---|---|---|---|---|
-| GQA (G=2) | 100% | **4.411** | **82.3** | 34.98 | 5.377 |
-| GKA, G=4 (ours) | 100% | 4.475 | 87.8 | 34.79 | **5.013** |
-| GKA + DRoPE16 (ours) | 56% | 4.449 | 85.5 | **35.08** | 5.525 |
-| GVA + DRoPE16 | 56% | 4.445 | 85.2 | 34.67 | 5.550 |
-| MQA (G=1) | 50% | **4.439** | 84.7 | 34.88 | 5.397 |
-| GVA, RoPE (no absorb) | 50% | 4.499 | 89.9 | 34.92 | 5.242 |
-| GKA, RoPE (ours) | 50% | 4.515 | 91.4 | 34.35 | 5.070 |
-| Shared KV (K=V) | 50% | 4.536 | 93.3 | 34.53 | 5.428 |
+GQA, MQA, GKA (RoPE) and GVA+DRoPE were trained with 3 seeds (1337 locally, 1 and 2 on a Colab A100; same data order, different init). Their numbers are means; ± is the std across seeds. The other rows are single runs.
 
-The zero-shot benchmarks (HellaSwag, ARC-E/C, OBQA, PIQA, WinoGrande) are all within about 1 point of chance at this scale. The spread across models (34.4–35.1) is within single-seed noise, so **validation loss is the metric that discriminates**.
+| Method | Seeds | KV cache vs GQA | Val loss ↓ | Val PPL | 6-task avg acc | Extrapolation: loss @2048 ctx ↓ |
+|---|---|---|---|---|---|---|
+| GQA (G=2) | 3 | 100% | **4.414 ± 0.003** | **82.6** | 34.91 | 5.42 |
+| GKA, G=4 (ours) | 1 | 100% | 4.475 | 87.8 | 34.79 | **5.01** |
+| GKA + DRoPE16 (ours) | 1 | 56% | 4.449 | 85.5 | 35.08 | 5.52 |
+| GVA + DRoPE16 | 3 | 56% | 4.448 ± 0.006 | 85.5 | 34.75 | 5.56 |
+| MQA (G=1) | 3 | 50% | **4.434 ± 0.009** | 84.2 | 34.74 | 5.43 |
+| GVA, RoPE (no absorb) | 1 | 50% | 4.499 | 89.9 | 34.92 | 5.24 |
+| GKA, RoPE (ours) | 3 | 50% | 4.497 ± 0.016 | 89.7 | 34.80 | 5.12 |
+| Shared KV (K=V) | 1 | 50% | 4.536 | 93.3 | 34.53 | 5.43 |
+
+Per-seed validation loss for the 3-seed models:
+
+| Method | seed 1337 | seed 1 | seed 2 |
+|---|---|---|---|
+| GQA | 4.411 | 4.417 | 4.414 |
+| MQA | 4.439 | 4.439 | 4.423 |
+| GVA + DRoPE16 | 4.445 | 4.445 | 4.456 |
+| GKA, RoPE | 4.515 | 4.487 | 4.489 |
+
+The zero-shot benchmarks (HellaSwag, ARC-E/C, OBQA, PIQA, WinoGrande) are all within about 1 point of chance at this scale. Every model lands at 34.7–35.1 on average, inside seed noise, so **validation loss is the metric that discriminates**.
 
 ### Inference (RTX 3050 laptop, bf16, PyTorch eager; B=32, T=4096)
 
@@ -122,15 +133,16 @@ The zero-shot benchmarks (HellaSwag, ARC-E/C, OBQA, PIQA, WinoGrande) are all wi
 
 ### What the experiments say
 
-1. **The GKA mechanism works exactly as derived.** The value map N folds into W_O, and GKA with ordinary RoPE decodes from a cache that is exactly half of GQA's (verified bit-for-bit against the full forward pass). GVA cannot do this without a decoupled RoPE slice.
-2. **Keys vs values is a wash once decoupled RoPE is used.** GKA+DRoPE (4.449) and GVA+DRoPE (4.445) are tied at an identical cache size, with equal decode speed.
-3. **Factorisation helps a little, as the expressivity argument predicts.** GKA beats Shared KV (4.515 vs 4.536) despite spanning the same function class. GVA with ordinary RoPE, the one variant with genuinely extra capacity, beats both.
-4. **Neither GKA nor GVA beats the simple equal-cache baseline here.** MQA (4.439, 50% cache) is better than every reconstruction method at 50–56% cache. GKA-G4 at GQA's cache size (4.475) loses to GQA (4.411). At this scale, a "shared key that must also carry content" is a worse use of cache scalars than an extra dedicated stream. This mirrors the GVA paper's own Shared-KV finding.
-5. **Unexpected upside: length extrapolation.** Both full-RoPE GKA models extrapolate best beyond the 512-token training length: loss @2048 is 5.07 (G=2) and 5.01 (G=4), versus 5.38 for GQA and 5.40 for MQA. The DRoPE variants extrapolate worst (5.52–5.55): their 16-dim shared positional channel degrades outside the trained range. This is single-seed, so it deserves a follow-up with more seeds and longer contexts.
-6. **Speed.** In eager PyTorch at this model size, decode throughput is dominated by launch overhead and weight reads, not cache reads. MQA ≈ GQA, so the halved cache shows up as memory (and batch capacity), not tokens/s. GKA with ordinary RoPE is slower at large B×T because eager mode materialises a rotated copy of the cached keys each step. A fused kernel would rotate in registers, but that kernel was not written here. Non-absorbable GVA is 13× slower at B=32, T=4096 because it rebuilds H keys per step.
+1. **The GKA mechanism works exactly as derived.** The value map N folds into W_O, and GKA with ordinary RoPE decodes from a cache that is exactly half of GQA's (verified against the full forward pass). GVA cannot do this without a decoupled RoPE slice.
+2. **GKA does not reach GQA quality at a lower cache at this scale.** The ranking GQA < MQA < GVA+DRoPE < GKA (RoPE) holds in every seed. The gaps to GQA (+0.020 / +0.035 / +0.083) are several times the seed spread (0.003–0.016).
+3. **Keys vs values is a wash once decoupled RoPE is used.** GKA+DRoPE (4.449, one seed) sits on GVA+DRoPE's 3-seed mean (4.448 ± 0.006) at an identical cache size and equal decode speed.
+4. **Factorisation helps a little, as the expressivity argument predicts.** GKA beats Shared KV (4.497 vs 4.536) despite spanning the same function class. GVA with ordinary RoPE, the one variant with genuinely extra capacity, is on par with GKA.
+5. **Neither GKA nor GVA beats the simple equal-cache baseline here.** MQA (4.434 ± 0.009, 50% cache) beats every reconstruction method at 50–56% cache in every seed. GKA-G4 at GQA's cache size (4.475) also loses to GQA (4.414). At this scale, a "shared key that must also carry content" is a worse use of cache scalars than an extra dedicated stream. This mirrors the GVA paper's own Shared-KV finding.
+6. **GKA's real strength: length extrapolation.** Full-RoPE GKA degrades least beyond the 512-token training length. At 2048 tokens its loss is 5.07 / 5.05 / 5.24 across seeds, against GQA's 5.38 / 5.39 / 5.50, so it wins in all three. GKA-G4 (5.01) is better still. The DRoPE variants extrapolate worst (5.52–5.56): their 16-dim shared positional channel degrades outside the trained range.
+7. **Speed.** In eager PyTorch at this model size, decode throughput is dominated by launch overhead and weight reads, not cache reads. MQA ≈ GQA, so the halved cache shows up as memory (and batch capacity), not tokens/s. GKA with ordinary RoPE is slower at large B×T because eager mode materialises a rotated copy of the cached keys each step. A fused kernel would rotate in registers, but that kernel was not written here. Non-absorbable GVA is 13× slower at B=32, T=4096 because it rebuilds H keys per step.
 
 ### Caveats
 
-* There is one seed per configuration. Loss gaps of ~0.01 (e.g. the DRoPE pair) are within noise; gaps ≥ 0.03 are consistent through training (see the curves).
+* Only four models have 3 seeds. GKA+DRoPE, GKA-G4, GVA (RoPE) and Shared KV are single runs, so differences under ~0.02 involving them are within noise.
 * The models are tiny (48M params, 40M tokens, about 0.1× Chinchilla). The GVA paper's near-parity claims are at 350M/30B and may not transfer down. Equally, MQA's edge here may not transfer up.
 * Inference numbers come from naive eager code on a laptop GPU. Cache-size and memory numbers are reliable; throughput is implementation-bound.
