@@ -1,0 +1,10 @@
+{
+  "attn": "gka",
+  "n_group": 2,
+  "seed": 1,
+  "params": 48046592,
+  "non_emb_params": 22290944,
+  "final_val_loss": 4.486976730823517,
+  "train_time_s": 207.0228672027588,
+  "tokens": 39993344
+}

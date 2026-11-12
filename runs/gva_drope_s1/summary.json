@@ -1,0 +1,10 @@
+{
+  "attn": "gva_drope",
+  "n_group": 2,
+  "seed": 1,
+  "params": 48636416,
+  "non_emb_params": 22880768,
+  "final_val_loss": 4.444630742073059,
+  "train_time_s": 227.83690357208252,
+  "tokens": 39993344
+}
