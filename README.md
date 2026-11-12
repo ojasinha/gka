@@ -10,7 +10,7 @@ GKA mirrors Grouped Value Attention (GVA; Tripathi, Kumar & Khan, FrontiersMind)
 |---|---|
 | GKA's mechanism works: N folds into W_O, so GKA decodes with **ordinary RoPE at exactly 50% of GQA's cache**. GVA cannot; it needs a decoupled RoPE slice (56% cache). | decode == forward tests, all variants |
 | **At the trained length, GKA does not reach GQA quality.** The ranking is GQA < MQA < GVA+DRoPE < GKA, and it holds in every seed. | val loss 4.414 / 4.434 / 4.448 / 4.497 |
-| **Keys vs values is a wash once decoupled RoPE is used.** GKA+DRoPE ≈ GVA+DRoPE in quality, cache size and speed. | 4.449 (1 seed) vs 4.448 ± 0.006 |
+| **GKA vs GVA: caching keys vs values doesn't change quality.** Under the same RoPE setup they tie, but with ordinary RoPE only GKA can absorb, which gives it 5× faster decode and half the memory. | DRoPE: 4.449 vs 4.448; RoPE: 4.497 vs 4.499 |
 | **GKA extrapolates best past its training length without any tricks.** This holds at both training lengths, in every seed. | trained 2048 → 16k: GKA 5.48 vs GQA 5.93 |
 | **With NTK RoPE scaling, GVA+DRoPE has the best long-context quality, beating GQA** with 44% less cache. | trained 2048 → 16k: 4.73 vs 4.93 |
 | The DRoPE variants collapse past the training length **without** NTK scaling. | trained 2048 → 16k plain: 6.54 |
@@ -125,10 +125,41 @@ Held-out loss beyond the training length (3 seeds; ± is the std across seeds):
 
 At this size, decode speed in eager mode is bound by launch overhead and weight reads, so the halved cache shows up as memory and batch capacity, not tokens/s. GKA (RoPE) is slower at large B×T only because eager mode materialises rotated keys each step; a fused kernel would rotate in registers. Non-absorbable GVA is 13× slower because it rebuilds H keys per step.
 
+### 4. GKA vs GVA, head to head
+
+The RoPE setup matters more than whether keys or values are cached, so the fair comparison holds it fixed. All models here were trained at 512 context.
+
+**Ordinary RoPE** (both 50% cache; GVA is 1 seed):
+
+| | GKA | GVA |
+|---|---|---|
+| Val loss @512 | 4.497 ± 0.016 | 4.499 |
+| Plain RoPE @2048 / @16k | **5.097 / 6.069** | 5.221 / 6.172 |
+| NTK @4096 / @16k | 4.948 / 5.507 | 4.940 / 5.508 |
+| Decode tok/s (B=32, T=4096) | **1345** | 262 |
+| Decode peak memory | **328 MB** | 644 MB |
+
+This is GKA's clear win. GVA with ordinary RoPE cannot absorb M, so it rebuilds every head's keys at each step. GKA absorbs N into W_O and gets the same quality, better plain-RoPE extrapolation, 5× faster decode and half the memory.
+
+**Decoupled RoPE** (both 56% cache; GKA+DRoPE is 1 seed):
+
+| | GKA + DRoPE | GVA + DRoPE |
+|---|---|---|
+| Val loss @512 | 4.449 | 4.448 ± 0.006 |
+| Plain RoPE @2048 | 5.510 | 5.550 |
+| NTK @4096 / @16k | 4.728 / 5.485 | 4.755 / 5.538 |
+| Decode tok/s | 2502 | 2473 |
+
+These are effectively identical, as the expressivity argument predicts: with DRoPE both reduce to the same function class.
+
+**Each method in its own recommended design** (GKA with ordinary RoPE vs GVA+DRoPE): GVA+DRoPE is better at the trained length (4.448 vs 4.497 at 512; 4.505 vs 4.641 at 2048) and with NTK scaling at 2–16× extension. GKA wins by a wide margin with plain RoPE (5.48 vs 6.54 at 16k, trained at 2048) and uses a slightly smaller cache (50% vs 56%).
+
+**Verdict:** caching keys versus values makes no difference to quality; under the same RoPE setup GKA ties GVA and never loses. GKA's advantage is structural: it absorbs with ordinary RoPE, so it needs no decoupled slice. That gives it the smallest absorbable cache and the most robust plain-RoPE extrapolation. GVA+DRoPE's edge in-distribution comes from DRoPE, not from caching values, because GKA+DRoPE matches it.
+
 ### Caveats
 
 * The models are tiny: 48M params and 40M tokens, about 0.1× Chinchilla. The GVA paper's near-parity claims are at 350M/30B, and rankings may change at scale.
-* GKA+DRoPE, GKA-G4, GVA (RoPE) and Shared KV are single runs, so differences under ~0.02 involving them are within noise.
+* GKA+DRoPE, GKA-G4, GVA (RoPE) and Shared KV are single runs, so differences under ~0.02 involving them are within noise. Neither GKA+DRoPE nor GVA (RoPE) was trained at 2048 context, so the like-for-like GKA vs GVA comparison covers 512-trained models only.
 * Throughput numbers come from naive eager code on a laptop GPU. Cache and memory numbers are reliable.
 
 ## Repository layout
