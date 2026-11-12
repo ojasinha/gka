@@ -1,0 +1,378 @@
+{
+  "gqa": {
+    "cache_scalars_per_token_per_layer": 256,
+    "cache_bytes_per_token_bf16": 4096,
+    "params": 48308736,
+    "runs": [
+      {
+        "B": 1,
+        "ctx": 512,
+        "prefill_chunk": 512,
+        "cache_MB": 2.0,
+        "prefill_ms": 10.572300001513213,
+        "decode_ms_per_step": 9.638918750056291,
+        "decode_tok_s": 103.74607629036815,
+        "peak_extra_MB": 10.44482421875
+      },
+      {
+        "B": 1,
+        "ctx": 2048,
+        "prefill_chunk": 512,
+        "cache_MB": 8.0,
+        "prefill_ms": 68.25989999924786,
+        "decode_ms_per_step": 9.754160937518463,
+        "decode_tok_s": 102.52035068988805,
+        "peak_extra_MB": 8.2724609375
+      },
+      {
+        "B": 16,
+        "ctx": 2048,
+        "prefill_chunk": 256,
+        "cache_MB": 128.0,
+        "prefill_ms": 868.2696999967447,
+        "decode_ms_per_step": 10.011985937467216,
+        "decode_tok_s": 1598.0845458566039,
+        "peak_extra_MB": 132.6923828125
+      },
+      {
+        "B": 32,
+        "ctx": 4096,
+        "prefill_chunk": 64,
+        "cache_MB": 512.0,
+        "prefill_ms": 6060.506999994686,
+        "decode_ms_per_step": 9.575546874998508,
+        "decode_tok_s": 3341.845684401705,
+        "peak_extra_MB": 525.4541015625
+      }
+    ]
+  },
+  "sharedkv": {
+    "cache_scalars_per_token_per_layer": 128,
+    "cache_bytes_per_token_bf16": 2048,
+    "params": 47784448,
+    "runs": [
+      {
+        "B": 1,
+        "ctx": 512,
+        "prefill_chunk": 512,
+        "cache_MB": 1.0,
+        "prefill_ms": 10.136199998669326,
+        "decode_ms_per_step": 9.14073124999959,
+        "decode_tok_s": 109.40043773850641,
+        "peak_extra_MB": 1.41650390625
+      },
+      {
+        "B": 1,
+        "ctx": 2048,
+        "prefill_chunk": 512,
+        "cache_MB": 4.0,
+        "prefill_ms": 66.84200000017881,
+        "decode_ms_per_step": 9.355968749900967,
+        "decode_tok_s": 106.88364045792532,
+        "peak_extra_MB": 5.36572265625
+      },
+      {
+        "B": 16,
+        "ctx": 2048,
+        "prefill_chunk": 256,
+        "cache_MB": 64.0,
+        "prefill_ms": 878.699200002302,
+        "decode_ms_per_step": 8.075281250057742,
+        "decode_tok_s": 1981.3551385452479,
+        "peak_extra_MB": 83.3486328125
+      },
+      {
+        "B": 32,
+        "ctx": 4096,
+        "prefill_chunk": 64,
+        "cache_MB": 256.0,
+        "prefill_ms": 6491.512300002796,
+        "decode_ms_per_step": 23.505612500002826,
+        "decode_tok_s": 1361.3769902824763,
+        "peak_extra_MB": 324.1962890625
+      }
+    ]
+  },
+  "gva": {
+    "cache_scalars_per_token_per_layer": 128,
+    "cache_bytes_per_token_bf16": 2048,
+    "params": 48046592,
+    "runs": [
+      {
+        "B": 1,
+        "ctx": 512,
+        "prefill_chunk": 512,
+        "cache_MB": 1.0,
+        "prefill_ms": 10.390799994638655,
+        "decode_ms_per_step": 9.898143749978772,
+        "decode_tok_s": 101.02904395605941,
+        "peak_extra_MB": 2.66748046875
+      },
+      {
+        "B": 1,
+        "ctx": 2048,
+        "prefill_chunk": 512,
+        "cache_MB": 4.0,
+        "prefill_ms": 71.3203000050271,
+        "decode_ms_per_step": 9.827426562537767,
+        "decode_tok_s": 101.75603894228104,
+        "peak_extra_MB": 10.36669921875
+      },
+      {
+        "B": 16,
+        "ctx": 2048,
+        "prefill_chunk": 256,
+        "cache_MB": 64.0,
+        "prefill_ms": 967.919399998209,
+        "decode_ms_per_step": 30.951529687513357,
+        "decode_tok_s": 516.9372939410749,
+        "peak_extra_MB": 163.3642578125
+      },
+      {
+        "B": 32,
+        "ctx": 4096,
+        "prefill_chunk": 64,
+        "cache_MB": 256.0,
+        "prefill_ms": 9376.051999999618,
+        "decode_ms_per_step": 122.35192499997538,
+        "decode_tok_s": 261.5406337089215,
+        "peak_extra_MB": 643.7275390625
+      }
+    ]
+  },
+  "gva_drope": {
+    "cache_scalars_per_token_per_layer": 144,
+    "cache_bytes_per_token_bf16": 2304,
+    "params": 48636416,
+    "runs": [
+      {
+        "B": 1,
+        "ctx": 512,
+        "prefill_chunk": 512,
+        "cache_MB": 1.125,
+        "prefill_ms": 12.085900001693517,
+        "decode_ms_per_step": 10.949421875011467,
+        "decode_tok_s": 91.32902279363063,
+        "peak_extra_MB": 1.31982421875
+      },
+      {
+        "B": 1,
+        "ctx": 2048,
+        "prefill_chunk": 512,
+        "cache_MB": 4.5,
+        "prefill_ms": 77.45750000322005,
+        "decode_ms_per_step": 11.35584531243694,
+        "decode_tok_s": 88.0603752945453,
+        "peak_extra_MB": 4.7734375
+      },
+      {
+        "B": 16,
+        "ctx": 2048,
+        "prefill_chunk": 256,
+        "cache_MB": 72.0,
+        "prefill_ms": 980.970000004163,
+        "decode_ms_per_step": 11.490235937458237,
+        "decode_tok_s": 1392.4866370967984,
+        "peak_extra_MB": 82.8720703125
+      },
+      {
+        "B": 32,
+        "ctx": 4096,
+        "prefill_chunk": 64,
+        "cache_MB": 288.0,
+        "prefill_ms": 6930.9983999992255,
+        "decode_ms_per_step": 12.937935937429756,
+        "decode_tok_s": 2473.346610677151,
+        "peak_extra_MB": 328.2978515625
+      }
+    ]
+  },
+  "gka": {
+    "cache_scalars_per_token_per_layer": 128,
+    "cache_bytes_per_token_bf16": 2048,
+    "params": 48046592,
+    "runs": [
+      {
+        "B": 1,
+        "ctx": 512,
+        "prefill_chunk": 512,
+        "cache_MB": 1.0,
+        "prefill_ms": 9.844199994404335,
+        "decode_ms_per_step": 8.547729687506944,
+        "decode_tok_s": 116.9901291405558,
+        "peak_extra_MB": 5.41650390625
+      },
+      {
+        "B": 1,
+        "ctx": 2048,
+        "prefill_chunk": 512,
+        "cache_MB": 4.0,
+        "prefill_ms": 67.1303999988595,
+        "decode_ms_per_step": 9.076581250042182,
+        "decode_tok_s": 110.17364054283684,
+        "peak_extra_MB": 9.36572265625
+      },
+      {
+        "B": 16,
+        "ctx": 2048,
+        "prefill_chunk": 256,
+        "cache_MB": 64.0,
+        "prefill_ms": 866.4239999998244,
+        "decode_ms_per_step": 8.38754999995217,
+        "decode_tok_s": 1907.5892245162458,
+        "peak_extra_MB": 87.3486328125
+      },
+      {
+        "B": 32,
+        "ctx": 4096,
+        "prefill_chunk": 64,
+        "cache_MB": 256.0,
+        "prefill_ms": 6395.803100000194,
+        "decode_ms_per_step": 23.79700624999259,
+        "decode_tok_s": 1344.706962877314,
+        "peak_extra_MB": 328.1962890625
+      }
+    ]
+  },
+  "gka_drope": {
+    "cache_scalars_per_token_per_layer": 144,
+    "cache_bytes_per_token_bf16": 2304,
+    "params": 48636416,
+    "runs": [
+      {
+        "B": 1,
+        "ctx": 512,
+        "prefill_chunk": 512,
+        "cache_MB": 1.125,
+        "prefill_ms": 11.583599996811245,
+        "decode_ms_per_step": 10.593006250019243,
+        "decode_tok_s": 94.40190786238641,
+        "peak_extra_MB": 5.31982421875
+      },
+      {
+        "B": 1,
+        "ctx": 2048,
+        "prefill_chunk": 512,
+        "cache_MB": 4.5,
+        "prefill_ms": 82.22869999735849,
+        "decode_ms_per_step": 10.698142187493431,
+        "decode_tok_s": 93.47417359707943,
+        "peak_extra_MB": 8.7724609375
+      },
+      {
+        "B": 16,
+        "ctx": 2048,
+        "prefill_chunk": 256,
+        "cache_MB": 72.0,
+        "prefill_ms": 976.6382000016165,
+        "decode_ms_per_step": 10.933906249988468,
+        "decode_tok_s": 1463.3379539006817,
+        "peak_extra_MB": 86.8564453125
+      },
+      {
+        "B": 32,
+        "ctx": 4096,
+        "prefill_chunk": 64,
+        "cache_MB": 288.0,
+        "prefill_ms": 6910.1937000014,
+        "decode_ms_per_step": 12.791465625014098,
+        "decode_tok_s": 2501.6679822383317,
+        "peak_extra_MB": 332.2666015625
+      }
+    ]
+  },
+  "gqa_g1": {
+    "cache_scalars_per_token_per_layer": 128,
+    "cache_bytes_per_token_bf16": 2048,
+    "params": 47784448,
+    "runs": [
+      {
+        "B": 1,
+        "ctx": 512,
+        "prefill_chunk": 512,
+        "cache_MB": 1.0,
+        "prefill_ms": 11.47579999815207,
+        "decode_ms_per_step": 9.824062500001673,
+        "decode_tok_s": 101.79088335399227,
+        "peak_extra_MB": 1.19482421875
+      },
+      {
+        "B": 1,
+        "ctx": 2048,
+        "prefill_chunk": 512,
+        "cache_MB": 4.0,
+        "prefill_ms": 68.66970000555739,
+        "decode_ms_per_step": 9.623959374948754,
+        "decode_tok_s": 103.90733803417835,
+        "peak_extra_MB": 4.2724609375
+      },
+      {
+        "B": 16,
+        "ctx": 2048,
+        "prefill_chunk": 256,
+        "cache_MB": 64.0,
+        "prefill_ms": 868.9769000047818,
+        "decode_ms_per_step": 9.925179687456875,
+        "decode_tok_s": 1612.061494485615,
+        "peak_extra_MB": 69.6005859375
+      },
+      {
+        "B": 32,
+        "ctx": 4096,
+        "prefill_chunk": 64,
+        "cache_MB": 256.0,
+        "prefill_ms": 5976.182600003085,
+        "decode_ms_per_step": 9.538789062503383,
+        "decode_tok_s": 3354.723517871968,
+        "peak_extra_MB": 269.9501953125
+      }
+    ]
+  },
+  "gka_g4": {
+    "cache_scalars_per_token_per_layer": 256,
+    "cache_bytes_per_token_bf16": 4096,
+    "params": 48570880,
+    "runs": [
+      {
+        "B": 1,
+        "ctx": 512,
+        "prefill_chunk": 512,
+        "cache_MB": 2.0,
+        "prefill_ms": 9.522799999103881,
+        "decode_ms_per_step": 8.517223437479515,
+        "decode_tok_s": 117.4091542085842,
+        "peak_extra_MB": 6.66650390625
+      },
+      {
+        "B": 1,
+        "ctx": 2048,
+        "prefill_chunk": 512,
+        "cache_MB": 8.0,
+        "prefill_ms": 68.70089999574702,
+        "decode_ms_per_step": 8.82887343755101,
+        "decode_tok_s": 113.26473383872452,
+        "peak_extra_MB": 14.36572265625
+      },
+      {
+        "B": 16,
+        "ctx": 2048,
+        "prefill_chunk": 256,
+        "cache_MB": 128.0,
+        "prefill_ms": 889.4880000007106,
+        "decode_ms_per_step": 12.095771875010541,
+        "decode_tok_s": 1322.7762697025944,
+        "peak_extra_MB": 167.3486328125
+      },
+      {
+        "B": 32,
+        "ctx": 4096,
+        "prefill_chunk": 64,
+        "cache_MB": 512.0,
+        "prefill_ms": 6962.809900003776,
+        "decode_ms_per_step": 43.36335000004965,
+        "decode_tok_s": 737.9503659187623,
+        "peak_extra_MB": 647.6962890625
+      }
+    ]
+  }
+}

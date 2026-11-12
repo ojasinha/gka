@@ -1,0 +1,10 @@
+{
+  "attn": "sharedkv",
+  "n_group": 2,
+  "seed": 1337,
+  "params": 47784448,
+  "non_emb_params": 22028800,
+  "final_val_loss": 4.536091315746307,
+  "train_time_s": 1948.8053133487701,
+  "tokens": 39993344
+}

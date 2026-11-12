@@ -1,0 +1,10 @@
+{
+  "attn": "gva",
+  "n_group": 2,
+  "seed": 1337,
+  "params": 48046592,
+  "non_emb_params": 22290944,
+  "final_val_loss": 4.4988890290260315,
+  "train_time_s": 2002.4505698680878,
+  "tokens": 39993344
+}

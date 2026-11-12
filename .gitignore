@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+
+# Tokenized datasets (regenerate with scripts/prepare_data.py)
+data/
+
+# Model checkpoints (~190 MB each, over GitHub's 100 MB file limit)
+*.pt
+
+# Raw stdout logs (run metrics are kept in runs/<name>/log.jsonl)
+logs/
+*.log
