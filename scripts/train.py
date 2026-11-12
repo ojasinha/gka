@@ -14,7 +14,7 @@ import torch
 
 from gka.model import GPT, Config, VARIANTS
 from gka.paths import DATA_DIR, RUNS_DIR
-from gka.runs import DEFAULT_N_GROUP, DEFAULT_SEED, run_name
+from gka.runs import DEFAULT_N_GROUP, DEFAULT_SEED, DEFAULT_SEQ_LEN, run_name
 
 p = argparse.ArgumentParser()
 p.add_argument("--attn", required=True, choices=VARIANTS)
@@ -28,6 +28,7 @@ p.add_argument("--wd", type=float, default=0.1)
 p.add_argument("--eval_every", type=int, default=200)
 p.add_argument("--eval_batches", type=int, default=40)
 p.add_argument("--n_group", type=int, default=DEFAULT_N_GROUP)
+p.add_argument("--seq_len", type=int, default=DEFAULT_SEQ_LEN, help="training context; keep micro_bs*accum*seq_len at 16384")
 p.add_argument("--seed", type=int, default=DEFAULT_SEED)
 p.add_argument("--data_seed", type=int, default=0)
 p.add_argument("--data", default=str(DATA_DIR))
@@ -38,7 +39,7 @@ torch.manual_seed(args.seed)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 dev = "cuda"
-cfg = Config(attn=args.attn, n_group=args.n_group)
+cfg = Config(attn=args.attn, n_group=args.n_group, seq_len=args.seq_len)
 T = cfg.seq_len
 
 data_dir = Path(args.data)
@@ -95,7 +96,7 @@ def lr_at(s):
     return args.lr * (args.min_lr_frac + (1 - args.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * prog)))
 
 
-name = run_name(args.attn, args.n_group, args.seed)
+name = run_name(args.attn, args.n_group, args.seed, args.seq_len)
 run_dir = Path(args.out) / name
 run_dir.mkdir(parents=True, exist_ok=True)
 log = open(run_dir / "log.jsonl", "w")
@@ -133,7 +134,7 @@ for step in range(steps + 1):
         print(f"step {step:5d} | loss {tl:.4f} | gn {gn:.2f} | {tps / 1e3:.1f}k tok/s", flush=True)
 
 torch.save({"cfg": cfg.to_dict(), "model": model.state_dict()}, run_dir / "model.pt")
-json.dump({"attn": args.attn, "n_group": args.n_group, "seed": args.seed, "params": model.num_params(False),
+json.dump({"attn": args.attn, "n_group": args.n_group, "seq_len": args.seq_len, "seed": args.seed, "params": model.num_params(False),
            "non_emb_params": model.num_params(), "final_val_loss": vl, "train_time_s": time.time() - t0,
            "tokens": steps * tok_per_step},
           open(run_dir / "summary.json", "w"), indent=2)

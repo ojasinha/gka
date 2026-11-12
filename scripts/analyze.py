@@ -6,21 +6,9 @@ import math
 import matplotlib.pyplot as plt
 
 from gka.paths import FIGURES_DIR, RESULTS_DIR, RUNS_DIR
+from gka.style import COLOR, LABEL, ORDER
 
 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-ORDER = ["gqa", "gka", "gka_drope", "gva_drope", "gva", "sharedkv", "gqa_g1", "gka_g4"]
-LABEL = {
-    "gqa": "GQA (baseline)",
-    "gka": "GKA (ours, RoPE)",
-    "gka_drope": "GKA + DRoPE16 (ours)",
-    "gva_drope": "GVA + DRoPE16",
-    "gva": "GVA (RoPE, no absorb)",
-    "sharedkv": "Shared KV (K=V)",
-    "gqa_g1": "MQA (GQA, G=1)",
-    "gka_g4": "GKA, G=4 (ours)",
-}
-# Reference categorical palette (dataviz skill), slots 1-6 in fixed order, light mode.
-COLOR = dict(zip(ORDER, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]))
 MC_TASKS = ["hellaswag", "arc_easy", "arc_challenge", "openbookqa", "piqa", "winogrande"]
 CHANCE = {"hellaswag": 25, "arc_easy": 25, "arc_challenge": 25, "openbookqa": 25, "piqa": 50, "winogrande": 50}
 

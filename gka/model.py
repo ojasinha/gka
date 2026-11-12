@@ -55,14 +55,27 @@ class Config:
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_len: int, base: float):
         super().__init__()
-        inv = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_len).float()
-        freqs = torch.outer(t, inv)  # (T, dim/2)
+        self.dim, self.base, self.ntk = dim, base, 1.0
+        self._build(max_len)
+
+    def _build(self, n, device=None):
+        # NTK-aware scaling: stretch the base so the lowest frequencies cover ntk x the trained length
+        # while the highest (local) frequencies stay almost unchanged.
+        base = self.base * self.ntk ** (self.dim / (self.dim - 2))
+        inv = 1.0 / (base ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+        freqs = torch.outer(torch.arange(n, device=device).float(), inv)  # (T, dim/2)
         self.register_buffer("cos", freqs.cos(), persistent=False)
         self.register_buffer("sin", freqs.sin(), persistent=False)
 
+    def set_ntk(self, factor: float):
+        """factor=1 is plain RoPE; factor=s targets contexts ~s x the training length."""
+        self.ntk = factor
+        self._build(len(self.cos), self.cos.device)
+
     def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         """Rotate x[..., T, dim] using positions pos (T,). Half-split convention."""
+        if pos.max() >= len(self.cos):  # grow the tables for long-context evaluation
+            self._build(2 * int(pos.max() + 1), self.cos.device)
         cos = self.cos[pos].to(x.dtype)
         sin = self.sin[pos].to(x.dtype)
         x1, x2 = x.chunk(2, dim=-1)
@@ -335,11 +348,20 @@ class GPT(nn.Module):
     def cache_scalars_per_token(self):
         return sum(b.attn.cache_scalars_per_token() for b in self.blocks)
 
-    def forward(self, idx, targets=None):
+    def set_rope_ntk(self, factor: float):
+        """Inference-time NTK RoPE scaling for every layer (1.0 restores plain RoPE)."""
+        for b in self.blocks:
+            b.attn.rope.set_ntk(factor)
+
+    def hidden(self, idx):
+        """Final normalised hidden states (B, T, d), i.e. everything but the LM head."""
         x = self.wte(idx)
         for b in self.blocks:
             x = b(x)
-        logits = self.lm_head(self.norm(x))
+        return self.norm(x)
+
+    def forward(self, idx, targets=None):
+        logits = self.lm_head(self.hidden(idx))
         if targets is None:
             return logits, None
         loss = F.cross_entropy(logits.float().view(-1, logits.size(-1)), targets.reshape(-1))

@@ -1,4 +1,4 @@
-﻿"""The absorbed cached decode path of every variant must reproduce the full forward pass."""
+"""The absorbed cached decode path of every variant must reproduce the full forward pass."""
 
 import pytest
 import torch
@@ -35,6 +35,21 @@ def test_cache_size(variant):
     assert GPT(cfg).cache_scalars_per_token() == expected * cfg.n_layer
 
 
-@pytest.mark.parametrize("name", DEFAULT_RUNS + ["gka_g4_s7", "gka_drope_s3"])
+@pytest.mark.parametrize("name", DEFAULT_RUNS + ["gka_g4_s7", "gka_drope_s3", "gka_c2048", "gqa_g1_c2048_s2"])
 def test_run_name_roundtrip(name):
     assert run_name(**parse_run_name(name)) == name
+
+
+def test_rope_tables_grow_and_ntk_one_is_identity():
+    torch.manual_seed(0)
+    cfg = Config(attn="gka", d_model=128, n_layer=2, n_head=8, n_group=2, head_dim=32, seq_len=16)
+    m = GPT(cfg).to(DEV).float().eval()
+    idx = torch.randint(0, cfg.vocab_size, (1, 300), device=DEV)  # far beyond the initial 8 x 16 tables
+    with torch.no_grad():
+        ref, _ = m(idx)
+        m.set_rope_ntk(4.0)
+        scaled, _ = m(idx)
+        m.set_rope_ntk(1.0)
+        back, _ = m(idx)
+    assert (ref - back).abs().max().item() < 1e-5
+    assert (ref - scaled).abs().max().item() > 1e-3

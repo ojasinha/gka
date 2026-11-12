@@ -50,7 +50,8 @@ All maps M/N use the scale-matched init from GVA App. A (σ = 1/√d_h), with no
 ```
 gka/                      the library
   model.py                  all attention variants + absorbed cached decode paths
-  runs.py                   run naming (gka_g4, gka_s7, ...) and checkpoint loading
+  runs.py                   run naming (gka_g4, gka_s7, gka_c2048, ...) and checkpoint loading
+  style.py                  model labels and plot colours
   paths.py                  data/, runs/, results/, logs/ locations
 scripts/                  entry points (run from any directory)
   prepare_data.py           stream + tokenize FineWeb-Edu -> data/{train,val}.bin
@@ -59,6 +60,8 @@ scripts/                  entry points (run from any directory)
   bench_inference.py        cache size / prefill / decode speed -> results/inference.json
   bench_train_throughput.py training tok/s and memory per variant
   analyze.py                tables + plots -> results/results.md, results/figures/
+  eval_long_context.py      loss at 512-16k context, plain vs NTK RoPE -> runs/<name>/long_context.json
+  analyze_long_context.py   -> results/long_context.md, results/figures/long_context.png
   run_all.ps1, run_all.sh   the whole pipeline, resumable
 tests/test_model.py       decode == forward for every variant, cache sizes, run names
 runs/<name>/              log.jsonl (training curve), summary.json, benchmarks.json
@@ -80,7 +83,8 @@ bash scripts/run_all.sh                          # or: powershell -File scripts/
 
 # or step by step:
 uv run python scripts/prepare_data.py            # 45M train / 2M val tokens
-uv run python scripts/train.py --attn gka        # one run; --n_group 4 -> runs/gka_g4, --seed 7 -> runs/gka_s7
+uv run python scripts/train.py --attn gka        # one run; --n_group 4 -> runs/gka_g4, --seed 7 -> runs/gka_s7,
+                                                 #   --seq_len 2048 --micro_bs 8 --accum 1 -> runs/gka_c2048
 uv run python scripts/evaluate.py --runs gqa gka # default: all eight runs
 uv run python scripts/bench_inference.py
 uv run python scripts/analyze.py                 # -> results/results.md + results/figures/
