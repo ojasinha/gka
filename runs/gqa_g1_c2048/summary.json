@@ -1,0 +1,11 @@
+{
+  "attn": "gqa",
+  "n_group": 1,
+  "seq_len": 2048,
+  "seed": 1337,
+  "params": 47784448,
+  "non_emb_params": 22028800,
+  "final_val_loss": 4.502449870109558,
+  "train_time_s": 235.82450532913208,
+  "tokens": 39993344
+}
