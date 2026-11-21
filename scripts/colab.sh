@@ -24,6 +24,7 @@ DRIVE="${GKA_DRIVE:-/content/drive/MyDrive/gka}"
 export GKA_DATA_DIR="${GKA_DATA_DIR:-/content/data}"
 export GKA_RUNS_DIR="$DRIVE/runs" GKA_RESULTS_DIR="$DRIVE/results" GKA_LOGS_DIR="$DRIVE/logs"
 export PATH="$HOME/.local/bin:$PATH"
+export MPLBACKEND=Agg  # Colab sets the notebook's inline backend, which the project's venv does not have
 mkdir -p "$GKA_RUNS_DIR" "$GKA_RESULTS_DIR" "$GKA_LOGS_DIR"
 log() { echo "$(date -Iseconds) $*" | tee -a "$GKA_LOGS_DIR/pipeline.log"; }
 py() { uv run --frozen python "$@"; }
@@ -82,7 +83,8 @@ train)
   ;;
 
 eval)
-  done_runs=$(for d in "$GKA_RUNS_DIR"/*/; do [[ -f "$d/model.pt" ]] && basename "$d"; done | tr '\n' ' ')
+  # `if`, not `[[ ]] && ...`: a false test on the last folder would fail the loop and, with set -e, end the script silently
+  done_runs=$(for d in "$GKA_RUNS_DIR"/*/; do if [[ -f "$d/model.pt" ]]; then basename "$d"; fi; done | tr '\n' ' ')
   [[ -n "$done_runs" ]] || { echo "no finished runs"; exit 1; }
   log "zero-shot eval: $done_runs"
   py scripts/evaluate.py --skip_done --runs $done_runs > >(tee -a "$GKA_LOGS_DIR/eval.log" | grep --line-buffered "5-task avg" | cut -c1-80) 2>&1
