@@ -242,16 +242,22 @@ class Attention(nn.Module):
             Wo = self.o_proj.weight.detach().T.view(H, dh, -1)  # (H, dh, d)
             self.Wo_abs = torch.einsum("hce,hef->hcf", Wuv, Wo).reshape(H * self.dc, -1).to(dtype)
 
-    def _grouped_scores(self, q, kc):
-        """q (B,H,Tq,D), kc (B,G,L,D) -> scores (B,H,Tq,L) without expanding the cache."""
+    # The cache is shared by groups of heads (G groups, or 1 for MLA's latent and the decoupled RoPE key).
+    # Folding each group's heads into the row dimension reads the cache once; a broadcast matmul
+    # (B,H,..) @ (B,1,..) would instead materialise a per-head copy of it at every decode step.
+    @staticmethod
+    def _grouped_scores(q, kc):
+        """q (B,H,Tq,D), kc (B,g,L,D) -> scores (B,H,Tq,L) without expanding the cache."""
         B, H, Tq, D = q.shape
-        qg = q.reshape(B, self.G, self.rep * Tq, D)
-        return (qg @ kc.transpose(-1, -2)).view(B, H, Tq, -1)
+        g = kc.shape[1]
+        return (q.reshape(B, g, H // g * Tq, D) @ kc.transpose(-1, -2)).view(B, H, Tq, -1)
 
-    def _grouped_av(self, a, vc):
-        """a (B,H,Tq,L), vc (B,G,L,D) -> (B,H,Tq,D)."""
+    @staticmethod
+    def _grouped_av(a, vc):
+        """a (B,H,Tq,L), vc (B,g,L,D) -> (B,H,Tq,D)."""
         B, H, Tq, L = a.shape
-        return (a.reshape(B, self.G, self.rep * Tq, L) @ vc).view(B, H, Tq, -1)
+        g = vc.shape[1]
+        return (a.reshape(B, g, H // g * Tq, L) @ vc).view(B, H, Tq, -1)
 
     def step(self, x, start: int):
         """Process a chunk x (B,T,d) at absolute positions [start, start+T) using the cache."""
@@ -293,16 +299,16 @@ class Attention(nn.Module):
         elif self.kind == "gva_drope":
             qt = torch.einsum("bhtd,hde->bhte", qc, self.M_T)  # absorbed query
             s = self._grouped_scores(qt, c["v"][:, :, :L])
-            s = s + self.rope(qr, pos) @ c["kr"][:, :, :L].transpose(-1, -2)
+            s = s + self._grouped_scores(self.rope(qr, pos), c["kr"][:, :, :L])
             scale = dh + self.dr
         elif self.kind == "gka_drope":
             s = self._grouped_scores(qc, c["k"][:, :, :L])
-            s = s + self.rope(qr, pos) @ c["kr"][:, :, :L].transpose(-1, -2)
+            s = s + self._grouped_scores(self.rope(qr, pos), c["kr"][:, :, :L])
             scale = dh + self.dr
         elif self.kind == "mla":
             qt = torch.einsum("bhtd,hdc->bhtc", qc, self.Uk)  # absorbed query, width dc
-            s = qt @ c["c"][:, :, :L].transpose(-1, -2)  # latent shared by all heads (broadcast)
-            s = s + self.rope(qr, pos) @ c["kr"][:, :, :L].transpose(-1, -2)
+            s = self._grouped_scores(qt, c["c"][:, :, :L])  # one latent shared by all heads
+            s = s + self._grouped_scores(self.rope(qr, pos), c["kr"][:, :, :L])
             scale = dh + self.dr
 
         s = s.float() / math.sqrt(scale)
@@ -317,7 +323,7 @@ class Attention(nn.Module):
             o = o.transpose(1, 2).reshape(B, T, H * dh)
             return o @ self.Wo_abs
         if self.kind == "mla":
-            o = a @ c["c"][:, :, :L]  # A_h c ; W_UV absorbed into W_O
+            o = self._grouped_av(a, c["c"][:, :, :L])  # A_h c ; W_UV absorbed into W_O
             o = o.transpose(1, 2).reshape(B, T, H * self.dc)
             return o @ self.Wo_abs
         vc = c["v"][:, :, :L]
