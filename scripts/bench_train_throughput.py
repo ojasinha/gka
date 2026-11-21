@@ -15,13 +15,13 @@ from gka.zclip import ZClip
 
 p = argparse.ArgumentParser()
 p.add_argument("--runs", nargs="+", default=MODELS, help="models, e.g. gqa gqa_g1 mla gka")
-p.add_argument("--micro_bs", type=int, default=16)
+p.add_argument("--micro_bs", type=int, default=64)
 p.add_argument("--seq_len", type=int, default=Config.seq_len)
 p.add_argument("--steps", type=int, default=20, help="timed micro-steps (after warm-up)")
 p.add_argument("--warmup", type=int, default=5, help="untimed micro-steps (includes compilation)")
 p.add_argument("--compile", action="store_true")
 p.add_argument("--tokens", type=int, default=1_000_000_000, help="tokens per run, for the projection")
-p.add_argument("--cu_per_hour", type=float, default=11.77, help="Colab compute units per hour of this GPU")
+p.add_argument("--cu_per_hour", type=float, default=6.73, help="Colab compute units per hour of this GPU (A100, measured)")
 args = p.parse_args()
 
 torch.set_float32_matmul_precision("high")
