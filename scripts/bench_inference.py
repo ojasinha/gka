@@ -1,7 +1,7 @@
 """Inference benchmark: KV-cache footprint, prefill latency, decode throughput, peak memory.
 
 Every variant decodes through its own cached path (model.step), i.e. the absorbed path for
-gva_drope / gka / gka_drope. Speed does not depend on weight values, so trained checkpoints
+gva_drope / gka / gka_drope / mla. Speed does not depend on weight values, so trained checkpoints
 are used when present and random init otherwise. Plain PyTorch eager, no custom kernels.
 """
 
@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 
 from gka.paths import RESULTS_DIR
-from gka.runs import DEFAULT_RUNS, load_model
+from gka.runs import MODELS, load_model
 
 DEV = "cuda"
 
@@ -65,12 +65,12 @@ def bench(m, B, ctx, n_dec=64, reps=3):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--runs", nargs="+", default=DEFAULT_RUNS, help="run names, e.g. gqa gka gka_g4")
-    p.add_argument("--settings", default="1x512,1x2048,16x2048,32x4096", help="comma-separated BATCHxCONTEXT")
+    p.add_argument("--runs", nargs="+", default=MODELS, help="run names, e.g. gqa gka gka_g4")
+    p.add_argument("--settings", default="1x1024,1x4096,16x4096,32x4096", help="comma-separated BATCHxCONTEXT")
     p.add_argument("--out", default=str(RESULTS_DIR / "inference.json"))
     args = p.parse_args()
     settings = [tuple(map(int, s.split("x"))) for s in args.settings.split(",")]
-    out = {}
+    out = {"_meta": {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__}}
     for v in args.runs:
         m = load(v)
         a = m.blocks[0].attn

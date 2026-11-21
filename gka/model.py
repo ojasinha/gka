@@ -14,6 +14,11 @@ Attention variants (H query heads, G key/value groups, head width dh, rope width
              RoPE is applied to cached keys on the fly (pure elementwise op), so no
              decoupled slice is needed.
   gka_drope  GKA + shared decoupled RoPE slice (direct mirror of gva_drope).     cache = G*dh + dr
+  mla        Multi-head latent attention (DeepSeek-V2, no query compression).    cache = dc + dr
+             Caches an RMS-normalised joint latent c (width dc) plus a shared rotated
+             positional key; per-head K and V are up-projected from c. At decode the
+             key up-projection is absorbed into the query and the value up-projection
+             into the output projection. (n_group is unused.)
 
 Every model exposes:
   forward(idx, targets)               training / full-sequence scoring (SDPA)
@@ -30,7 +35,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-VARIANTS = ["gqa", "sharedkv", "gva", "gva_drope", "gka", "gka_drope"]
+VARIANTS = ["gqa", "sharedkv", "gva", "gva_drope", "gka", "gka_drope", "mla"]
+DECOUPLED = ("gva_drope", "gka_drope", "mla")  # variants with a shared decoupled RoPE slice
 
 
 @dataclass
@@ -42,8 +48,9 @@ class Config:
     n_head: int = 8
     n_group: int = 2
     head_dim: int = 64
-    rope_dim: int = 16  # only used by *_drope variants
-    seq_len: int = 512
+    rope_dim: int = 16  # only used by the decoupled-RoPE variants (*_drope, mla)
+    kv_latent: int = 128  # only used by mla: latent width dc (dc + dr = 144 matches gva_drope's cache)
+    seq_len: int = 1024
     rope_base: float = 10000.0
 
     def to_dict(self):
@@ -93,10 +100,16 @@ class Attention(nn.Module):
         H, G, dh, dr, d = cfg.n_head, cfg.n_group, cfg.head_dim, cfg.rope_dim, cfg.d_model
         assert H % G == 0
         self.H, self.G, self.dh, self.dr, self.rep = H, G, dh, dr, H // G
-        self.drope = self.kind.endswith("_drope")
+        self.drope = self.kind in DECOUPLED
 
-        # query: content slice dh per head (+ rope slice dr per head for drope variants)
+        # query: content slice dh per head (+ rope slice dr per head for decoupled variants)
         self.q_proj = nn.Linear(d, H * (dh + (dr if self.drope else 0)), bias=False)
+        if self.kind == "mla":
+            dc = self.dc = cfg.kv_latent
+            self.kv_down = nn.Linear(d, dc, bias=False)  # c = RMSNorm(x W_DKV), the cached latent
+            self.kv_norm = nn.RMSNorm(dc)
+            self.k_up = nn.Linear(dc, H * dh, bias=False)  # content keys  K_h = c W_UK^h
+            self.v_up = nn.Linear(dc, H * dh, bias=False)  # values        V_h = c W_UV^h
         if self.kind == "gqa":
             self.k_proj = nn.Linear(d, G * dh, bias=False)
             self.v_proj = nn.Linear(d, G * dh, bias=False)
@@ -123,6 +136,11 @@ class Attention(nn.Module):
         if self.drope:
             return q[..., : self.dh], q[..., self.dh :]
         return q, None
+
+    def _latent(self, x):
+        """MLA latent c = RMSNorm(x W_DKV), normalised in fp32 and returned in the input's dtype."""
+        h = self.kv_down(x)
+        return F.rms_norm(h.float(), (self.dc,), self.kv_norm.weight.float(), self.kv_norm.eps).to(h.dtype)
 
     def _group(self, t):  # (B,G,T,D) -> (B,H,T,D)
         return t.repeat_interleave(self.rep, dim=1)
@@ -167,6 +185,14 @@ class Attention(nn.Module):
             q = torch.cat([qc, self.rope(qr, pos)], -1)
             kk = torch.cat([self._group(k), kr], -1)
             y = F.scaled_dot_product_attention(q, kk, v, is_causal=True)
+        elif self.kind == "mla":
+            c = self._latent(x)  # (B,T,dc) latent
+            kc = self.k_up(c).view(B, T, self.H, dh).transpose(1, 2)
+            v = self.v_up(c).view(B, T, self.H, dh).transpose(1, 2)
+            kr = self.rope(self.kr_proj(x).unsqueeze(1), pos).expand(B, self.H, T, self.dr)
+            q = torch.cat([qc, self.rope(qr, pos)], -1)
+            k = torch.cat([kc, kr], -1)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2).reshape(B, T, self.H * dh)
         return self.o_proj(y)
@@ -174,6 +200,8 @@ class Attention(nn.Module):
     # -- inference with persistent cache (absorbed decode paths) ---------------
     def cache_scalars_per_token(self) -> int:
         G, dh, dr = self.G, self.dh, self.dr
+        if self.kind == "mla":
+            return self.dc + dr
         return {
             "gqa": 2 * G * dh,
             "sharedkv": G * dh,
@@ -191,6 +219,8 @@ class Attention(nn.Module):
             c["v"] = torch.zeros(B, G, Tmax, dh, dtype=dtype, device=device)
         elif self.kind in ("sharedkv", "gva", "gva_drope"):
             c["v"] = torch.zeros(B, G, Tmax, dh, dtype=dtype, device=device)
+        elif self.kind == "mla":
+            c["c"] = torch.zeros(B, 1, Tmax, self.dc, dtype=dtype, device=device)
         else:
             c["k"] = torch.zeros(B, G, Tmax, dh, dtype=dtype, device=device)
         if self.drope:
@@ -204,6 +234,13 @@ class Attention(nn.Module):
             # y = sum_h (A_h K_g) N_h W_O^h  ->  W_O' = blockdiag(N) @ W_O^T
             Wo = self.o_proj.weight.detach().T.view(H, dh, -1)  # (H, dh, d)
             self.Wo_abs = torch.einsum("hde,hef->hdf", self.N.detach(), Wo).reshape(H * dh, -1).to(dtype)
+        if self.kind == "mla":
+            # score: q_h . (c U_h^T) = (q_h U_h) . c       with U_h = W_UK^h (dh, dc)
+            self.Uk = self.k_up.weight.detach().view(H, dh, self.dc).to(dtype)
+            # output: sum_h (A_h c) W_UV^h^T W_O^h  ->  W_O' (H*dc, d)
+            Wuv = self.v_up.weight.detach().view(H, dh, self.dc).transpose(1, 2)  # (H, dc, dh)
+            Wo = self.o_proj.weight.detach().T.view(H, dh, -1)  # (H, dh, d)
+            self.Wo_abs = torch.einsum("hce,hef->hcf", Wuv, Wo).reshape(H * self.dc, -1).to(dtype)
 
     def _grouped_scores(self, q, kc):
         """q (B,H,Tq,D), kc (B,G,L,D) -> scores (B,H,Tq,L) without expanding the cache."""
@@ -231,6 +268,8 @@ class Attention(nn.Module):
             c["v"][:, :, start:L] = self.v_proj(x).view(B, T, G, dh).transpose(1, 2)
         elif self.kind in ("sharedkv", "gva", "gva_drope"):
             c["v"][:, :, start:L] = self.v_proj(x).view(B, T, G, dh).transpose(1, 2)
+        elif self.kind == "mla":
+            c["c"][:, :, start:L] = self._latent(x).unsqueeze(1)
         else:
             c["k"][:, :, start:L] = self.k_proj(x).view(B, T, G, dh).transpose(1, 2)
         if self.drope:
@@ -260,6 +299,11 @@ class Attention(nn.Module):
             s = self._grouped_scores(qc, c["k"][:, :, :L])
             s = s + self.rope(qr, pos) @ c["kr"][:, :, :L].transpose(-1, -2)
             scale = dh + self.dr
+        elif self.kind == "mla":
+            qt = torch.einsum("bhtd,hdc->bhtc", qc, self.Uk)  # absorbed query, width dc
+            s = qt @ c["c"][:, :, :L].transpose(-1, -2)  # latent shared by all heads (broadcast)
+            s = s + self.rope(qr, pos) @ c["kr"][:, :, :L].transpose(-1, -2)
+            scale = dh + self.dr
 
         s = s.float() / math.sqrt(scale)
         if T > 1:
@@ -271,6 +315,10 @@ class Attention(nn.Module):
         if self.kind in ("gka", "gka_drope"):
             o = self._grouped_av(a, c["k"][:, :, :L])  # A_h K_g ; N_h absorbed into W_O
             o = o.transpose(1, 2).reshape(B, T, H * dh)
+            return o @ self.Wo_abs
+        if self.kind == "mla":
+            o = a @ c["c"][:, :, :L]  # A_h c ; W_UV absorbed into W_O
+            o = o.transpose(1, 2).reshape(B, T, H * self.dc)
             return o @ self.Wo_abs
         vc = c["v"][:, :, :L]
         o = self._grouped_av(a, vc)
@@ -331,6 +379,13 @@ class GPT(nn.Module):
                 nn.init.normal_(a.M, std=1 / math.sqrt(a.dh))
             if hasattr(a, "N"):
                 nn.init.normal_(a.N, std=1 / math.sqrt(a.dh))
+            # MLA, same principle: c is RMS-normalised (RMS 1, like the block input), so an up-projection
+            # of fan-in dc needs std 0.02 * sqrt(d_model / dc) for K and V to start at the RMS of a
+            # direct d_model -> dh projection (what GQA's K and V get).
+            if a.kind == "mla":
+                std = 0.02 * math.sqrt(cfg.d_model / a.dc)
+                nn.init.normal_(a.k_up.weight, std=std)
+                nn.init.normal_(a.v_up.weight, std=std)
 
     def _init(self, m):
         if isinstance(m, nn.Linear):
@@ -378,7 +433,7 @@ class GPT(nn.Module):
         for b in self.blocks:
             a = b.attn
             a.cache = None
-            for n in ("M_T", "Wo_abs"):
+            for n in ("M_T", "Wo_abs", "Uk"):
                 if hasattr(a, n):
                     delattr(a, n)
 

@@ -2,13 +2,14 @@
 
 import json
 import math
+import sys
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 from gka.paths import FIGURES_DIR, RESULTS_DIR, RUNS_DIR
-from gka.runs import parse_run_name
+from gka.runs import DEFAULT_N_GROUP, parse_run_name
 from gka.style import COLOR, LABEL, ORDER
 
 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
@@ -17,11 +18,13 @@ FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 groups = defaultdict(lambda: defaultdict(list))
 for path in sorted(RUNS_DIR.glob("*/long_context.json")):
     spec = parse_run_name(path.parent.name)
-    key = spec["attn"] + ("" if spec["n_group"] == 2 else f"_g{spec['n_group']}")
+    key = spec["attn"] + ("" if spec["n_group"] == DEFAULT_N_GROUP else f"_g{spec['n_group']}")
     res = json.load(open(path))
     groups[key][res["train_len"]].append(res)
 
 train_lens = sorted({t for g in groups.values() for t in g})
+if not train_lens:
+    raise SystemExit(f"no long_context.json in {RUNS_DIR}; run scripts/eval_long_context.py first")
 models = [m for m in ORDER if m in groups]
 
 
@@ -89,4 +92,5 @@ fig.savefig(FIGURES_DIR / "long_context.png", dpi=150)
 lines.append("![Loss by token position](figures/long_context.png)\n")
 
 open(RESULTS_DIR / "long_context.md", "w", encoding="utf-8").write("\n".join(lines))
+sys.stdout.reconfigure(encoding="utf-8")  # tables contain ± and Δ; the Windows console defaults to cp1252
 print("\n".join(lines))
