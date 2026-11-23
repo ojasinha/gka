@@ -14,6 +14,14 @@ Attention variants (H query heads, G key/value groups, head width dh, rope width
              RoPE is applied to cached keys on the fly (pure elementwise op), so no
              decoupled slice is needed.
   gka_drope  GKA + shared decoupled RoPE slice (direct mirror of gva_drope).     cache = G*dh + dr
+  gka_xg     GKA with cross-group values: V_h = [K_1..K_G] N_h, N_h (G*dh, dh).  cache = G*dh
+             Every head's value reads the whole cached key vector instead of its own
+             group's slice; N_h is still absorbed into W_O (per group).
+  gka_vrope  GKA with rotated values: o_t = sum_j a_tj (k_j R_j) R_t^T N_h W_O^h  cache = G*dh
+             = sum_j a_tj k_j R_{j-t} N_h W_O^h. The relative rotation sits between
+             k and N_h, so the model no longer collapses to Shared KV; R_t^T acts on
+             the aggregated output, so N_h is still absorbed.
+  gka_xg_vrope  both of the above.                                             cache = G*dh
   mla        Multi-head latent attention (DeepSeek-V2, no query compression).    cache = dc + dr
              Caches an RMS-normalised joint latent c (width dc) plus a shared rotated
              positional key; per-head K and V are up-projected from c. At decode the
@@ -35,8 +43,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-VARIANTS = ["gqa", "sharedkv", "gva", "gva_drope", "gka", "gka_drope", "mla"]
+VARIANTS = ["gqa", "sharedkv", "gva", "gva_drope", "gka", "gka_drope", "mla", "gka_xg", "gka_vrope", "gka_xg_vrope"]
 DECOUPLED = ("gva_drope", "gka_drope", "mla")  # variants with a shared decoupled RoPE slice
+GKA_ROPE = ("gka", "gka_xg", "gka_vrope", "gka_xg_vrope")  # GKA with ordinary RoPE on the cached keys
+GKA = GKA_ROPE + ("gka_drope",)
 
 
 @dataclass
@@ -79,12 +89,15 @@ class Rotary(nn.Module):
         self.ntk = factor
         self._build(len(self.cos), self.cos.device)
 
-    def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        """Rotate x[..., T, dim] using positions pos (T,). Half-split convention."""
+    def forward(self, x: torch.Tensor, pos: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+        """Rotate x[..., T, dim] using positions pos (T,). Half-split convention.
+        inverse=True applies the transpose rotation R_pos^T = R_{-pos}."""
         if pos.max() >= len(self.cos):  # grow the tables for long-context evaluation
             self._build(2 * int(pos.max() + 1), self.cos.device)
         cos = self.cos[pos].to(x.dtype)
         sin = self.sin[pos].to(x.dtype)
+        if inverse:
+            sin = -sin
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
@@ -101,6 +114,8 @@ class Attention(nn.Module):
         assert H % G == 0
         self.H, self.G, self.dh, self.dr, self.rep = H, G, dh, dr, H // G
         self.drope = self.kind in DECOUPLED
+        self.xg = self.kind in ("gka_xg", "gka_xg_vrope")  # values from every group's key
+        self.vrope = self.kind in ("gka_vrope", "gka_xg_vrope")  # rotated values, output rotated back
 
         # query: content slice dh per head (+ rope slice dr per head for decoupled variants)
         self.q_proj = nn.Linear(d, H * (dh + (dr if self.drope else 0)), bias=False)
@@ -115,12 +130,13 @@ class Attention(nn.Module):
             self.v_proj = nn.Linear(d, G * dh, bias=False)
         elif self.kind in ("sharedkv", "gva", "gva_drope"):
             self.v_proj = nn.Linear(d, G * dh, bias=False)  # only V is projected / cached
-        elif self.kind in ("gka", "gka_drope"):
+        elif self.kind in GKA:
             self.k_proj = nn.Linear(d, G * dh, bias=False)  # only K is projected / cached
         if self.kind in ("gva", "gva_drope"):
             self.M = nn.Parameter(torch.empty(H, dh, dh))  # K_h = V_g M_h
-        if self.kind in ("gka", "gka_drope"):
-            self.N = nn.Parameter(torch.empty(H, dh, dh))  # V_h = K_g N_h
+        if self.kind in GKA:
+            # V_h = K_g N_h, or V_h = [K_1..K_G] N_h for the cross-group variants
+            self.N = nn.Parameter(torch.empty(H, G * dh if self.xg else dh, dh))
         if self.drope:
             self.kr_proj = nn.Linear(d, dr, bias=False)  # shared positional key
         self.o_proj = nn.Linear(H * dh, d, bias=False)
@@ -144,6 +160,19 @@ class Attention(nn.Module):
 
     def _group(self, t):  # (B,G,T,D) -> (B,H,T,D)
         return t.repeat_interleave(self.rep, dim=1)
+
+    def _derotate(self, y, pos):
+        """Rotated-value GKA: apply R_t^T to an aggregated output y (B,H,T,n*dh), one dh-wide chunk
+        per source group (each chunk was rotated as its own dh-dim key)."""
+        B, H, T, C = y.shape
+        if C == self.dh:
+            return self.rope(y, pos, inverse=True)
+        y = y.view(B, H, T, C // self.dh, self.dh).transpose(2, 3)  # (B,H,n,T,dh)
+        return self.rope(y, pos, inverse=True).transpose(2, 3).reshape(B, H, T, C)
+
+    def _all_groups(self, k):  # (B,G,T,dh) -> (B,1,T,G*dh), group g in chunk g
+        B, G, T, dh = k.shape
+        return k.transpose(1, 2).reshape(B, 1, T, G * dh)
 
     # -- training / full-sequence forward -------------------------------------
     def forward(self, x):
@@ -178,6 +207,18 @@ class Attention(nn.Module):
             v = torch.einsum("bhtd,hde->bhte", self._group(k), self.N)  # per-head values
             q, kr = self.rope(qc, pos), self.rope(k, pos)
             y = F.scaled_dot_product_attention(q, self._group(kr), v, is_causal=True)
+        elif self.kind == "gka_xg":
+            k = self.k_proj(x).view(B, T, G, dh).transpose(1, 2)
+            v = torch.einsum("bztc,hce->bhte", self._all_groups(k), self.N)  # each head reads all groups
+            q, kr = self.rope(qc, pos), self.rope(k, pos)
+            y = F.scaled_dot_product_attention(q, self._group(kr), v, is_causal=True)
+        elif self.kind in ("gka_vrope", "gka_xg_vrope"):
+            # values are the rotated keys; aggregate, rotate back by the query position, then apply N_h
+            k = self.k_proj(x).view(B, T, G, dh).transpose(1, 2)
+            q, kr = self.rope(qc, pos), self.rope(k, pos)
+            v = self._all_groups(kr).expand(B, self.H, T, G * dh) if self.xg else self._group(kr)
+            y = F.scaled_dot_product_attention(q, self._group(kr), v, is_causal=True)
+            y = torch.einsum("bhtc,hce->bhte", self._derotate(y, pos), self.N)
         elif self.kind == "gka_drope":
             k = self.k_proj(x).view(B, T, G, dh).transpose(1, 2)
             v = torch.einsum("bhtd,hde->bhte", self._group(k), self.N)
@@ -208,6 +249,9 @@ class Attention(nn.Module):
             "gva": G * dh,
             "gva_drope": G * dh + dr,
             "gka": G * dh,
+            "gka_xg": G * dh,
+            "gka_vrope": G * dh,
+            "gka_xg_vrope": G * dh,
             "gka_drope": G * dh + dr,
         }[self.kind]
 
@@ -230,10 +274,11 @@ class Attention(nn.Module):
         H = self.H
         if self.kind == "gva_drope":
             self.M_T = self.M.detach().transpose(1, 2).to(dtype)  # q~ = q M^T
-        if self.kind in ("gka", "gka_drope"):
-            # y = sum_h (A_h K_g) N_h W_O^h  ->  W_O' = blockdiag(N) @ W_O^T
+        if self.kind in GKA:
+            # y = sum_h (A_h K) N_h W_O^h  ->  W_O' = blockdiag(N) @ W_O^T, shape (H * N rows, d);
+            # N_h has dh rows, or G*dh for the cross-group variants (one dh-row block per group)
             Wo = self.o_proj.weight.detach().T.view(H, dh, -1)  # (H, dh, d)
-            self.Wo_abs = torch.einsum("hde,hef->hdf", self.N.detach(), Wo).reshape(H * dh, -1).to(dtype)
+            self.Wo_abs = torch.einsum("hce,hef->hcf", self.N.detach(), Wo).reshape(-1, Wo.shape[-1]).to(dtype)
         if self.kind == "mla":
             # score: q_h . (c U_h^T) = (q_h U_h) . c       with U_h = W_UK^h (dh, dc)
             self.Uk = self.k_up.weight.detach().view(H, dh, self.dc).to(dtype)
@@ -286,9 +331,9 @@ class Attention(nn.Module):
         if self.kind == "gqa":
             s = self._grouped_scores(self.rope(qc, pos), c["k"][:, :, :L])
             scale = dh
-        elif self.kind in ("sharedkv", "gka"):
+        elif self.kind == "sharedkv" or self.kind in GKA_ROPE:
             # rotate cached (unrotated) keys on the fly; a fused kernel does this in registers
-            krot = self.rope(c["k" if self.kind == "gka" else "v"][:, :, :L], allpos)
+            krot = self.rope(c["v" if self.kind == "sharedkv" else "k"][:, :, :L], allpos)
             s = self._grouped_scores(self.rope(qc, pos), krot)
             scale = dh
         elif self.kind == "gva":
@@ -318,10 +363,15 @@ class Attention(nn.Module):
         a = s.softmax(-1).to(x.dtype)
 
         # 3) aggregate
-        if self.kind in ("gka", "gka_drope"):
-            o = self._grouped_av(a, c["k"][:, :, :L])  # A_h K_g ; N_h absorbed into W_O
-            o = o.transpose(1, 2).reshape(B, T, H * dh)
-            return o @ self.Wo_abs
+        if self.kind in GKA:
+            src = krot if self.vrope else c["k"][:, :, :L]  # rotated-value variants aggregate rotated keys
+            if self.xg:  # every head against every group's keys: A_h K_1, ..., A_h K_G
+                o = torch.cat([self._grouped_av(a, src[:, g : g + 1]) for g in range(G)], -1)
+            else:  # A_h K_g
+                o = self._grouped_av(a, src)
+            if self.vrope:
+                o = self._derotate(o, pos)
+            return o.transpose(1, 2).reshape(B, T, -1) @ self.Wo_abs  # N_h absorbed into W_O
         if self.kind == "mla":
             o = self._grouped_av(a, c["c"][:, :, :L])  # A_h c ; W_UV absorbed into W_O
             o = o.transpose(1, 2).reshape(B, T, H * self.dc)
@@ -383,8 +433,8 @@ class GPT(nn.Module):
             # keeps the reconstructed stream at the same RMS as a directly projected one.
             if hasattr(a, "M"):
                 nn.init.normal_(a.M, std=1 / math.sqrt(a.dh))
-            if hasattr(a, "N"):
-                nn.init.normal_(a.N, std=1 / math.sqrt(a.dh))
+            if hasattr(a, "N"):  # fan-in dh, or G*dh for the cross-group variants (rotation keeps the RMS)
+                nn.init.normal_(a.N, std=1 / math.sqrt(a.N.shape[1]))
             # MLA, same principle: c is RMS-normalised (RMS 1, like the block input), so an up-projection
             # of fan-in dc needs std 0.02 * sqrt(d_model / dc) for K and V to start at the RMS of a
             # direct d_model -> dh projection (what GQA's K and V get).

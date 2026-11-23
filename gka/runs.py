@@ -65,9 +65,11 @@ CORE_MODELS = ["gqa", "gqa_g1", "mla", "gva_drope", "gva", "gka"]  # 3 seeds eac
 SEEDS = [DEFAULT_SEED, 1, 2]
 REFERENCE_MODELS = ["sharedkv"]  # 1 seed, a reference floor as in the GVA paper
 OPTIONAL_MODELS = ["gka_g4"]  # 1 seed, only if compute is left
+# Follow-up: can GKA escape its Shared-KV function class? (cross-group values, rotated values, both)
+GKA_VARIANT_MODELS = ["gka_xg", "gka_vrope", "gka_xg_vrope"]  # 3 seeds each
 
 # One run per model at the default seed (inference benchmark: speed does not depend on the seed).
-MODELS = CORE_MODELS + REFERENCE_MODELS
+MODELS = CORE_MODELS + REFERENCE_MODELS + GKA_VARIANT_MODELS
 
 
 def with_seed(model: str, seed: int) -> str:
@@ -75,5 +77,8 @@ def with_seed(model: str, seed: int) -> str:
     return run_name(**{**parse_run_name(model), "seed": seed})
 
 
-# Every run of the main experiment, seed-major, so that a partial budget still gives complete seeds.
-DEFAULT_RUNS = [with_seed(m, s) for s in SEEDS for m in CORE_MODELS] + REFERENCE_MODELS
+# Every run, seed-major within each experiment, so that a partial budget still gives complete seeds:
+# the main experiment (19 runs), then the GKA follow-up (9 runs).
+MAIN_RUNS = [with_seed(m, s) for s in SEEDS for m in CORE_MODELS] + REFERENCE_MODELS
+GKA_VARIANT_RUNS = [with_seed(m, s) for s in SEEDS for m in GKA_VARIANT_MODELS]
+DEFAULT_RUNS = MAIN_RUNS + GKA_VARIANT_RUNS

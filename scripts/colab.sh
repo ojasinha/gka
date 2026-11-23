@@ -7,11 +7,13 @@
 #   !bash /content/gka/scripts/colab.sh setup     # uv + dependencies, tokenized data (built once, cached on Drive)
 #   !bash /content/gka/scripts/colab.sh smoke     # every model: compiled train + checkpoint + eval + save (~15 min)
 #   !bash /content/gka/scripts/colab.sh timing    # tok/s per model -> hours and CU per 1B-token run
-#   !bash /content/gka/scripts/colab.sh train     # the 19 runs; re-run the same command after a disconnect
+#   !bash /content/gka/scripts/colab.sh train     # all runs not yet finished (main 19 + GKA follow-up 9);
+#                                                 # re-run the same command after a disconnect
 #   !bash /content/gka/scripts/colab.sh eval      # zero-shot benchmarks + long-context eval (plain and NTK)
 #   !bash /content/gka/scripts/colab.sh bench     # inference benchmark
 #   !bash /content/gka/scripts/colab.sh analyze   # results/*.md and figures
 #
+# `smoke` and `timing` take optional model names, e.g. `colab.sh smoke gka_xg gka_vrope`.
 # Every new Colab session needs `setup` again (it reuses the data cached on Drive, ~2 min).
 # `train` with OPTIONAL=1 also trains the optional runs (gka_g4) after the main ones.
 #
@@ -56,17 +58,18 @@ smoke)
   # Short runs at the real batch settings with --compile, into a throwaway folder on local disk.
   out=/content/smoke
   rm -rf "$out"
-  for name in $(runs MODELS); do
+  models="${*:2}"; [[ -n "$models" ]] || models=$(runs MODELS)
+  for name in $models; do
     log "smoke $name"
     py scripts/train.py --run "$name" --compile --tokens $((20 * 131072)) --warmup 5 --eval_every 10 \
       --eval_batches 2 --final_eval_batches 4 --ckpt_every 10 --out "$out" 2>&1 | tee "$GKA_LOGS_DIR/smoke_$name.log" | grep -E "params|final val|Error"
     [[ -f "$out/$name/summary.json" && -f "$out/$name/model.pt" ]] || { log "smoke $name FAILED"; exit 1; }
   done
-  log "smoke passed for: $(runs MODELS)"
+  log "smoke passed for: $models"
   ;;
 
 timing)
-  py scripts/bench_train_throughput.py --compile 2>&1 | tee "$GKA_LOGS_DIR/timing.log"
+  py scripts/bench_train_throughput.py --compile ${2:+--runs "${@:2}"} 2>&1 | tee "$GKA_LOGS_DIR/timing.log"
   ;;
 
 train)
