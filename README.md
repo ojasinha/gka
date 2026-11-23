@@ -6,7 +6,7 @@ Grouped Value Attention (GVA; Tripathi, Kumar & Khan) shrinks the KV cache by ca
 
 ## Result in one paragraph
 
-**No, not on quality.** At 48M parameters and 1B tokens, GKA is 0.035 val loss behind plain MQA at the same 50% cache size (3 seeds each, about 5 standard errors). It also trails GVA with ordinary RoPE by 0.013. Its strengths are elsewhere. It keeps ordinary RoPE and still absorbs its reconstruction at decode, which makes it the fastest model at batch 1 and in prefill and 2× faster than GVA (RoPE) at batch 32. Together with GVA (RoPE), it also degrades least beyond the training length. The GVA paper's headline does not reproduce at this scale: GVA+DRoPE ties MQA despite a larger cache, and MLA is the strongest of the compressed methods.
+**No, not on quality.** At 48M parameters and 1B tokens, GKA is 0.035 val loss behind plain MQA at the same 50% cache size (3 seeds each, about 5 standard errors). It also trails GVA with ordinary RoPE by 0.013. Its strengths are elsewhere. It keeps ordinary RoPE and still absorbs its reconstruction at decode, which makes it the fastest model at batch 1 and in prefill and 2× faster than GVA (RoPE) at batch 32. Together with GVA (RoPE), it also degrades least beyond the training length. The GVA paper's headline does not reproduce at this scale: GVA+DRoPE ties MQA despite a larger cache, and MLA is the strongest of the compressed methods. A [follow-up](#follow-up-can-gka-be-made-more-expressive) tried three ways to make GKA's values more expressive while keeping it absorbable. Letting each head's values read both key groups closes the gap to GVA (RoPE), but not to MQA. Rotating the values with RoPE makes things worse.
 
 ## Method
 
@@ -46,7 +46,7 @@ So GKA keeps ordinary RoPE, caches exactly 50% of GQA, and never materialises pe
 
 * **Model:** 8 layers, $d_\text{model} = 512$, 8 query heads, 2 KV groups, $d_h = 64$, SwiGLU, RMSNorm, tied embeddings, GPT-2 BPE, about 48M params.
 * **Training:** 1B FineWeb-Edu tokens (about Chinchilla for 48M), 1024 context, 131k-token batches, AdamW (0.9, 0.95), lr 1.5e-3 with cosine decay, wd 0.1, ZClip gradient clipping, bf16, one A100. Every run sees the same data in the same order; the seed changes only the initialisation.
-* **Runs:** 3 seeds (1337, 1, 2) for every model except Shared KV (1 seed, a reference floor). 19 runs in total.
+* **Runs:** 3 seeds (1337, 1, 2) for every model except Shared KV (1 seed, a reference floor). 19 runs in the main comparison, plus 9 for the [follow-up](#follow-up-can-gka-be-made-more-expressive).
 * **Metrics:** held-out val loss on 3.3M tokens (primary); the GVA paper's 5 zero-shot tasks plus PIQA and LAMBADA; loss at 1k–16k context with plain and NTK-scaled RoPE; decode and prefill speed.
 
 ## Results
@@ -76,17 +76,17 @@ All numbers are mean ± std over seeds. Full tables: [`results/results.md`](resu
 
 | Model | Cache MB (B=32, T=4096) | decode tok/s B=1, T=4096 | decode tok/s B=32, T=4096 | prefill ms B=32, T=4096 |
 |---|---|---|---|---|
-| GQA | 512 | 94 | 2924 | 1119 |
-| MQA | 256 | 94 | **2985** | 1118 |
-| MLA | 288 | 78 | 2423 | 1332 |
-| GVA + DRoPE16 | 288 | 82 | 2473 | 1304 |
-| GVA (RoPE) | 256 | 93 | 1401 | 1567 |
-| **GKA (RoPE)** | 256 | **103** | 2804 | **1069** |
-| Shared KV | 256 | 100 | 2806 | 1070 |
+| GQA | 512 | 97 | 3003 | 1113 |
+| MQA | 256 | 96 | **3045** | 1106 |
+| MLA | 288 | 80 | 2497 | 1312 |
+| GVA + DRoPE16 | 288 | 84 | 2586 | 1280 |
+| GVA (RoPE) | 256 | 95 | 1410 | 1555 |
+| **GKA (RoPE)** | 256 | **105** | 2851 | **1064** |
+| Shared KV | 256 | 104 | 2830 | **1063** |
 
-* **GKA is the fastest at batch 1 and in prefill.** At batch 32 it is within 4% of GQA. Rotating the cached keys again at every step costs little on an A100. (On an L4, with far less memory bandwidth, it cost about 40%.)
+* **GKA is the fastest at batch 1 and in prefill,** tied with Shared KV, which has the same decode path. At batch 32 it is within 5% of GQA. Rotating the cached keys again at every step costs little on an A100. (On an L4, with far less memory bandwidth, it cost about 40%.)
 * **GKA is 2× faster than GVA (RoPE) at batch 32,** which must rebuild every head's keys at each step because M cannot be absorbed.
-* **Decode at this size is mostly launch-bound,** so halving the cache shows up as memory, not speed (MQA vs GQA: +2%). The cache savings matter more for large models.
+* **Decode at this size is mostly launch-bound,** so halving the cache shows up as memory, not speed (MQA vs GQA: +1%). The cache savings matter more for large models.
 
 ### Long context (trained at 1024)
 
@@ -106,17 +106,43 @@ All numbers are mean ± std over seeds. Full tables: [`results/results.md`](resu
 * **The DRoPE models extrapolate worst.** Their 16-dim positional slice breaks down first.
 * Every model is far worse at 16k than at 1024. This is "breaks down less", not "works at long context".
 
+## Follow-up: can GKA be made more expressive?
+
+GKA's weakness is that $N_h W_O^h$ collapses into one matrix. Three variants try to fix this without giving up the 50% cache or the absorbed decode (3 seeds each):
+
+| name | values seen by head $h$ | what it changes |
+|---|---|---|
+| `gka_xg` | $[k^{(1)}_j, k^{(2)}_j] \, N_h$ | values read **both** key groups (128 dims, not 64). Still collapses, but into a wider value. +0.26M params. |
+| `gka_vrope` | $k_j R_{j-t} \, N_h$ | values are the **rotated** keys, rotated back by the query's position. The relative rotation sits between $k_j$ and $N_h$, so it no longer collapses. Implemented as: aggregate rotated keys, then apply $R_t^\top$, then $N_h W_O^h$. |
+| `gka_xg_vrope` | $[k^{(1)}_j, k^{(2)}_j] R_{j-t} \, N_h$ | both |
+
+`tests/test_model.py` checks each against this per-pair definition, as well as decode against forward.
+
+| Model | Val loss ↓ | Δ vs GKA | plain @2048 | NTK @16384 | decode tok/s B=32 | prefill ms B=32 |
+|---|---|---|---|---|---|---|
+| GVA (RoPE), for reference | 3.5288 ± 0.0045 | −0.013 | 4.000 ± 0.051 | 4.868 ± 0.045 | 1410 | 1555 |
+| GKA | 3.5420 ± 0.0054 | – | **3.957 ± 0.104** | **4.864 ± 0.088** | **2851** | **1064** |
+| GKA + cross-group V | **3.5315 ± 0.0056** | **−0.011** | 4.128 ± 0.141 | 5.033 ± 0.123 | 2660 | 1109 |
+| GKA + rotated V | 3.5706 ± 0.0051 | +0.029 | 4.215 ± 0.065 | 5.143 ± 0.040 | 2359 | 1361 |
+| GKA + cross-group + rotated V | 3.5403 ± 0.0063 | −0.002 | 4.339 ± 0.108 | 5.209 ± 0.060 | 2121 | 1421 |
+
+* **Cross-group values help.** They improve on GKA by 0.011, about 2.3 standard errors, and tie with GVA (RoPE). They keep absorption, decode 1.9× faster than GVA (RoPE) at batch 32 and cost only 7% vs GKA. They are still 0.025 behind MQA.
+* **Rotated values hurt.** They are 0.029 worse than GKA (about 7 standard errors) and even worse than Shared KV. The likely reason is that a value rotated by $R_{j-t}$ depends on its distance from the query. In the high-frequency RoPE dimensions, the same content then points in a different direction at every distance, and averaging over many positions scrambles it. Breaking the collapse this way adds position-dependence, not useful capacity.
+* **Combining them cancels out.** The cross-group gain and the rotation loss leave the combination level with plain GKA, at the highest decode cost of the four.
+* **All three lose GKA's long-context edge.** At NTK @16384 they are 0.17–0.35 behind GKA, which puts them back with GQA and MQA. Plain, unrotated values derived from the keys seem to be what made GKA extrapolate well.
+
 ## Conclusions
 
 1. **At 50% cache, use MQA, not GKA,** if quality at the training length is what matters. GKA's $V = KN$ constraint costs about 0.035 val loss here.
 2. **GKA does deliver what it was designed for:** an absorbable 50%-cache attention with ordinary RoPE. It is the fastest model at batch 1 and in prefill, 2× faster than GVA (RoPE), and among the best at extrapolating past the training length.
 3. **The GVA paper's result does not reproduce at 48M / 1B tokens.** GVA+DRoPE ties MQA despite a 12% larger cache, and MLA matches or beats it at the same cache size.
+4. **GKA with cross-group values reaches GVA (RoPE) quality at about twice its batch-32 decode speed,** but gives up GKA's long-context advantage. Rotating the values is a dead end.
 
 ### Caveats
 
 * These are small models, 48M params and 1B tokens. The GVA paper's claims are at 350M params and 30B tokens, and rankings may change with scale.
 * Shared KV is one seed. Gaps under about 0.02 involving MLA, MQA and GVA+DRoPE are within noise.
-* The speed numbers come from straightforward PyTorch code, not fused kernels. MLA and GVA+DRoPE also train about 25% slower here, because their 80-wide q/k vs 64-wide v rules out the fastest attention kernel. That is an implementation detail, not a property of the methods.
+* The speed numbers come from straightforward PyTorch code, not fused kernels. MLA and GVA+DRoPE also train about 25% slower here, because their 80-wide q/k vs 64-wide v rules out the fastest attention kernel. That is an implementation detail, not a property of the methods. The same applies to `gka_xg_vrope` (128-wide values, 30% slower to train).
 * `mla_s1` and `gva_drope_s2` resumed from a checkpoint after a Colab disconnect. Their results are unaffected, but their `log.jsonl` starts at the resume step.
 
 ## Repository layout
@@ -145,14 +171,14 @@ Not in git: `data/`, `logs/` and the `runs/*/model.pt` checkpoints.
 
 ## Reproduce
 
-Needs [uv](https://docs.astral.sh/uv/) and an NVIDIA GPU (the lockfile pins PyTorch for CUDA 12.8). One run takes about 45 min on an A100 (about 58 min for MLA and GVA+DRoPE). All 19 runs plus evals cost about 120 Colab compute units.
+Needs [uv](https://docs.astral.sh/uv/) and an NVIDIA GPU (the lockfile pins PyTorch for CUDA 12.8). One run takes about 45 min on an A100 (about 58 min for MLA and GVA+DRoPE, 64 min for `gka_xg_vrope`). All 28 runs plus evals cost about 170 Colab compute units (120 for the main 19).
 
 On Colab (A100), after mounting Google Drive:
 
 ```bash
 git clone -b from-scratch https://github.com/ojasinha/gka.git /content/gka
 bash /content/gka/scripts/colab.sh setup     # dependencies + tokenized data (cached on Drive)
-bash /content/gka/scripts/colab.sh train     # all 19 runs; re-run after a disconnect to resume
+bash /content/gka/scripts/colab.sh train     # all 28 runs; re-run after a disconnect to resume
 bash /content/gka/scripts/colab.sh eval      # zero-shot + long-context
 bash /content/gka/scripts/colab.sh bench     # inference
 bash /content/gka/scripts/colab.sh analyze   # tables and figures

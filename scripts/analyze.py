@@ -138,14 +138,33 @@ if inf_models:
     P("")
 
 # ---------------------------------------------------------------- quality vs cache scatter (direct-labelled)
-fig, ax = plt.subplots(figsize=(7, 4.5))
-for v in variants:
-    x = 2 * summ[v][0]["cache_scalars_per_token"]  # bf16 bytes per token, all layers
-    ys = [s["final_val_loss"] for s in summ[v]]
-    ax.errorbar(x, mean(ys), yerr=std(ys) if len(ys) > 1 else None, fmt="o", ms=8, color=COLOR[v],
-                mec="white", mew=2, capsize=3, zorder=3)
-    ax.annotate(LABEL[v], (x, mean(ys)), textcoords="offset points", xytext=(8, 4), fontsize=9, color="#0b0b0b")
-ax.set_xlabel("KV cache bytes per token (bf16, all layers)")
+fig, ax = plt.subplots(figsize=(8, 5.5))
+pts = {v: (2 * summ[v][0]["cache_scalars_per_token"],  # bf16 bytes per token, all layers
+           [s["final_val_loss"] for s in summ[v]]) for v in variants}
+ys_all = [mean(ys) for _, ys in pts.values()]
+gap = 0.06 * (max(ys_all) - min(ys_all))  # min vertical distance between labels
+x_min = min(x for x, _ in pts.values())
+for x in sorted({x for x, _ in pts.values()}):
+    # Many models share a cache size: spread their points a little sideways and their labels vertically,
+    # with the labels of the leftmost column on its left so they do not run into the next column.
+    group = sorted((v for v in variants if pts[v][0] == x), key=lambda v: mean(pts[v][1]))
+    left = x == x_min and len(group) > 1
+    y_lab = []
+    for v in group:
+        y_lab.append(max(mean(pts[v][1]), y_lab[-1] + gap) if y_lab else mean(pts[v][1]))
+    shift = (sum(y_lab) - sum(mean(pts[v][1]) for v in group)) / len(group)  # re-centre the label column
+    for i, v in enumerate(group):
+        ys = pts[v][1]
+        xj = x + (i - (len(group) - 1) / 2) * 40
+        ax.errorbar(xj, mean(ys), yerr=std(ys) if len(ys) > 1 else None, fmt="o", ms=7, color=COLOR[v],
+                    mec="white", mew=1.5, capsize=3, zorder=3)
+        lx = x - 140 if left else xj + 60
+        ax.annotate(LABEL[v], (xj, mean(ys)), xytext=(lx, y_lab[i] - shift), fontsize=9, color="#0b0b0b",
+                    ha="right" if left else "left", va="center",
+                    arrowprops=dict(arrowstyle="-", color="#a0a0a0", lw=0.6, shrinkA=2, shrinkB=4))
+xs = [x for x, _ in pts.values()]
+ax.set_xlim(min(xs) - 1300, max(xs) + 700)
+ax.set_xlabel("KV cache bytes per token (bf16, all layers; equal sizes spread apart for legibility)")
 ax.set_ylabel("final validation loss (mean ± std over seeds)")
 ax.grid(alpha=0.25)
 ax.spines[["top", "right"]].set_visible(False)
