@@ -1,211 +1,251 @@
 # GKA: Grouped Key Attention
 
-GKA mirrors Grouped Value Attention (GVA; Tripathi, Kumar & Khan, FrontiersMind). GVA caches grouped **values** and rebuilds per-head keys. GKA caches grouped **keys** and rebuilds per-head values. This repo implements both, along with GQA, MQA and Shared-KV baselines. It trains each one from scratch (48M params, 3 seeds for the main models) and compares quality, long-context behaviour and inference cost.
+**Grouped Key Attention (GKA)** is the mirror image of Grouped Value Attention (GVA; Tripathi, Kumar & Khan): instead of caching grouped **values** and reconstructing per-head keys, GKA caches grouped **keys** and reconstructs per-head values.
 
-**Question:** can GKA match GQA quality with a smaller KV cache, or beat GVA?
+This repository trains GKA from scratch under an identical 48M-parameter, 1B-token recipe against GQA, MQA, GVA (two variants), MLA, a Shared-KV baseline, and three GKA expressivity extensions — 28 runs in total — comparing language-modeling quality, zero-shot benchmarks, long-context extrapolation, and inference speed/memory.
 
-## TL;DR
+**Core question:** At 50% of GQA's KV cache, can GKA match MQA, GVA, or MLA?
 
-| Finding | Evidence (3 seeds unless noted) |
-|---|---|
-| GKA's mechanism works: N folds into W_O, so GKA decodes with **ordinary RoPE at exactly 50% of GQA's cache**. GVA cannot; it needs a decoupled RoPE slice (56% cache). | decode == forward tests, all variants |
-| **At the trained length, GKA does not reach GQA quality.** The ranking is GQA < MQA < GVA+DRoPE < GKA, and it holds in every seed. | val loss 4.414 / 4.434 / 4.448 / 4.497 |
-| **GKA vs GVA: caching keys vs values doesn't change quality.** Under the same RoPE setup they tie, but with ordinary RoPE only GKA can absorb, which gives it 5× faster decode and half the memory. | DRoPE: 4.449 vs 4.448; RoPE: 4.497 vs 4.499 |
-| **GKA extrapolates best past its training length without any tricks.** This holds at both training lengths, in every seed. | trained 2048 → 16k: GKA 5.48 vs GQA 5.93 |
-| **With NTK RoPE scaling, GVA+DRoPE has the best long-context quality, beating GQA** with 44% less cache. | trained 2048 → 16k: 4.73 vs 4.93 |
-| The DRoPE variants collapse past the training length **without** NTK scaling. | trained 2048 → 16k plain: 6.54 |
+---
 
-**In practice:** use GVA+DRoPE when you can apply NTK scaling at inference; it gives near-GQA quality in-distribution and better than GQA at long contexts. GKA is the choice when you need graceful length extrapolation with plain RoPE. Neither beats GQA at the trained length at this scale.
+## Key Findings
 
-## Method
+* **On quality, no — MQA is better at the same 50% cache.** GKA trails plain MQA by **0.035 val loss** (`3.5420` vs `3.5068`, ~5.7 SE across 3 seeds) and trails GVA with ordinary RoPE by **0.013** (`3.5288`, ~3.3 SE). One independent key group plus one value group (MQA) beats two key groups whose values are linearly derived from them.
+* **Why:** Because GKA's value reconstruction $N_h$ merges into the output projection $W_O^h$, plain GKA spans the **same function class as Shared KV** ($K = V$). Its edge over Shared KV (`3.5420` vs `3.5585`, 1 seed) comes from the over-parameterized factorization $N_h W_O^h$ during optimization, not higher representational capacity.
+* **On inference speed, GKA delivers what it was built for.** It keeps standard RoPE while still absorbing its reconstruction into $W_O$ at decode. In eager PyTorch on an A100, it is the **fastest model in prefill and at batch 1–16 decode**, stays within 5% of GQA/MQA at batch 32, and runs **2× faster than GVA (RoPE)** at batch 32 with half the peak decode memory.
+* **On long-context extrapolation, GKA and GVA (RoPE) degrade least.** Beyond the 1024-token training window, both lose ~0.27–0.34 less nats than GQA/MQA (with plain RoPE at 2k–4k and with NTK scaling up to 16k), while decoupled-RoPE models (`GVA + DRoPE16`, `MLA`) degrade fastest under plain RoPE.
+* **The GVA paper's headline does not reproduce at this scale (48M / 1B tokens).** `GVA + DRoPE16` ties MQA (`3.5090` vs `3.5068`) despite using 12.5% more cache, and MLA (`3.4961`) is the strongest compressed method overall (though MLA, MQA, and GVA+DRoPE are within ~1.5 SE of each other).
+* **Follow-up variants:** Letting each head read **both** key groups (`gka_xg`) genuinely expands capacity, closing the gap to GVA (RoPE) (`3.5315` vs `3.5288`) at 1.9× its batch-32 decode speed — though still 0.025 behind MQA. Applying relative RoPE to values (`gka_vrope`) makes quality significantly worse (`3.5706`, below Shared KV). All three follow-up variants lose GKA's long-context edge.
 
-| | cached content | reconstructed | absorbed at decode into |
-|---|---|---|---|
-| GQA | K_g (rotated), V_g | — | — |
-| GVA | V_g | K_h = V_g M_h | the query: q̃_h = q_h M_hᵀ |
-| **GKA** | **K_g (unrotated)** | **V_h = K_g N_h** | **the output projection: W_O' = blockdiag(N_h) W_O** |
+---
 
-**RoPE does not break GKA's absorption.** In GVA, M_h sits between the two RoPE rotations, `q R_{j−t} M_hᵀ v_jᵀ`, so it cannot be folded into the query, and GVA needs a decoupled RoPE slice. In GKA the reconstruction happens after the softmax:
+## How GKA Works
 
-```
-o_t = Σ_h softmax_j( q_t R_t (k_{j,g} R_j)ᵀ / √d ) · k_{j,g} N_h W_O^h
-                    └─ score: rotate cached K on the fly ─┘   └ absorbed ┘
-```
+| Variant | Cached per token | Reconstructed | Absorbed at decode into | Positional encoding |
+|---|---|---|---|---|
+| **GQA** | $K_g$ (rotated), $V_g$ | — | — | Standard RoPE |
+| **GVA (RoPE)** | $V_g$ | $K_h = V_g M_h$ | *Cannot absorb* | Standard RoPE |
+| **GVA + DRoPE** | $V_g$, shared $K_r$ | $K_h^c = V_g M_h$ | Query: $\tilde{q}_h^c = q_h^c M_h^\top$ | Decoupled RoPE (+$d_r$ cache) |
+| **GKA (ours)** | **$K_g$ (unrotated)** | **$V_h = K_g N_h$** | **Output projection: $\tilde{W}_O^h = N_h W_O^h$** | **Standard RoPE** |
 
-The cache stores the unrotated key, rotated elementwise for scoring. `N_h W_O^h` is a fixed matrix. So GKA keeps ordinary RoPE and caches exactly 50% of GQA.
+### Why GKA absorbs with ordinary RoPE (and GVA cannot)
 
-**Expressivity.** Because `N_h W_O^h` collapses into one matrix, GKA spans the same function class as Shared KV (values = unrotated keys) with a per-head output projection. With decoupled RoPE, GVA's `W_Q^h M_hᵀ` collapses the same way. So GKA, GKA+DRoPE and GVA+DRoPE add no capacity over Shared KV, and any differences come from optimisation. The exception is GVA with ordinary RoPE. That is why `sharedkv` is included as a control, and why GKA+DRoPE and GVA+DRoPE end up tied.
+In **GVA with ordinary RoPE**, the per-head reconstruction matrix $M_h$ sits between the relative rotation and the cached value:
 
-### Variants (`gka/model.py`)
+$$
+\left(q_{h,t} R_t\right)\left(v_{g,j} M_h R_j\right)^\top = q_{h,t} \, R_{t-j} \, M_h^\top \, v_{g,j}^\top
+$$
 
-| name | description | cache scalars / token / layer (G=2, d_h=64, d_r=16) |
-|---|---|---|
-| `gqa` | grouped-query baseline | 256 |
-| `gqa_g1` | MQA (GQA with one KV group); equal-cache control for GKA | 128 (−50%) |
-| `gka` | **ours**, ordinary RoPE, absorbed decode | 128 (−50%) |
-| `gka_drope` | ours + shared decoupled RoPE slice | 144 (−43.75%) |
-| `gka_g4` | ours with 4 key groups; equal-cache control for GQA | 256 |
-| `gva_drope` | GVA paper's serving design | 144 (−43.75%) |
-| `gva` | GVA with ordinary RoPE (cannot absorb; rebuilds H keys per step) | 128 (−50%) |
-| `sharedkv` | K = V control (GVA paper's first cut) | 128 (−50%) |
+Because $M_h^\top$ does not commute with $R_{t-j}$, it cannot be folded into $q_{h,t}$. Serving GVA therefore forces a choice: either materialize and rotate all $H$ heads' keys at every decode step (`gva`), or move RoPE into a separate decoupled slice (`gva_drope`), adding $d_r$ scalars per token to the cache.
 
-M/N use GVA's scale-matched init (σ = 1/√d_h). `tests/test_model.py` checks that every variant's absorbed cached decode path reproduces the full forward pass.
+In **GKA**, reconstruction happens *after* the attention weights:
 
-## Experiments
+$$
+o_t = \sum_{h=1}^{H} \sum_{j \le t} \operatorname{softmax}_j \!\left( \frac{\left(q_{h,t} R_t\right)\left(k_{g,j} R_j\right)^\top}{\sqrt{d_h}} \right) k_{g,j} \underbrace{\left(N_h W_O^h\right)}_{\tilde{W}_O^h \text{ (fixed at inference)}}
+$$
 
-* **Model:** 8 layers, d_model 512, 8 query heads, 2 KV groups, d_h 64, SwiGLU, RMSNorm, tied embeddings, GPT-2 BPE; about 48M params.
-* **Training:** 40M FineWeb-Edu (sample-10BT) tokens per run, AdamW (0.9, 0.95), lr 1.5e-3 cosine, wd 0.1, 16k-token batches, bf16. Data order is identical for every run; seeds change only the init.
-* **Experiment 1, quality at 512 context:** all 8 variants. GQA, MQA, GKA and GVA+DRoPE use 3 seeds (1337 on an RTX 3050 laptop, 1 and 2 on a Colab A100).
-* **Experiment 2, long context:** GQA, MQA, GKA and GVA+DRoPE are retrained at **2048 context** (3 seeds each, same 40M tokens). Every 512- and 2048-trained run is then evaluated on held-out loss at 512–16k context. Each run is evaluated with RoPE as trained ("plain") and with inference-time NTK-aware RoPE scaling (factor = context / training length).
-* **Experiment 3, inference:** cache bytes, prefill latency, decode tok/s and peak memory through each variant's absorbed cached path.
-* **Zero-shot benchmarks:** HellaSwag, ARC-E/C, OBQA, PIQA, WinoGrande, LAMBADA. All are near chance at this scale, so **held-out loss is the metric that discriminates.**
+Because the cache stores **unrotated** keys $k_{g,j}$, GKA rotates $k_{g,j}$ on the fly to compute scores (a pure elementwise op), aggregates the unrotated $k_{g,j}$, and multiplies once by the pre-merged matrix $\tilde{W}_O^h = N_h W_O^h$. It never materializes per-head values and needs no decoupled RoPE slice.
+
+### The expressivity catch
+
+That absorption comes with a structural cost:
+* **Plain GKA collapses to Shared KV's function class.** In Shared KV ($V = K$), `o_proj` already gives each head its own unconstrained $d_h \times d_\text{model}$ matrix $W_O^h$. Replacing $W_O^h$ with $N_h W_O^h$ (where $N_h \in \mathbb{R}^{d_h \times d_h}$) spans the exact same set of functions — any gain over Shared KV comes purely from optimization dynamics of the factorized linear map.
+* **GVA (RoPE) does *not* collapse.** Because $M_h^\top$ does not commute with $R_{t-j}$, each head can align different linear combinations of $V_g$ with the RoPE frequency bands.
+* **GVA + DRoPE** collapses $W_{Q,c}^h M_h^\top$ on the content branch, *but* gains a dedicated 16-dim positional key projected directly from $x$, freeing the 128 cached value scalars from carrying RoPE features.
+
+`tests/test_model.py` verifies that every variant's cached, absorbed `step()` path matches its full `forward()` pass.
+
+---
+
+## Experimental Setup
+
+* **Architecture:** 8-layer decoder-only Transformer, $d_\text{model} = 512$, 8 query heads, 2 KV groups (except MQA with 1 group), $d_h = 64$, SwiGLU MLP, RMSNorm, tied GPT-2 BPE embeddings (`vocab_size = 50,304`), ~48M total parameters (~22–24M non-embedding, ~5M in attention).
+* **Training:** 1B FineWeb-Edu tokens (7,629 steps × 131,072 tokens/step, roughly Chinchilla-optimal for 48M params), context length 1024, AdamW ($\beta_1=0.9, \beta_2=0.95$, lr `1.5e-3` with 200-step warmup and cosine decay to `1.5e-4`, weight decay `0.1`), ZClip adaptive gradient clipping, `bf16` autocast with `torch.compile`, NVIDIA A100-40GB. Every run sees the exact same token windows in the same order; `--seed` changes initialization only.
+* **Runs:** 3 seeds (`1337`, `1`, `2`) for all 6 core models and all 3 GKA follow-up variants, plus 1 seed for Shared KV as a reference floor — **28 runs total** (19 main + 9 follow-up).
+* **Evaluation:**
+  * *Primary:* Held-out validation loss on **3.28M** FineWeb-Edu tokens (400 batches × 8 × 1024).
+  * *Zero-shot:* The GVA paper's 5-task average (HellaSwag, WinoGrande, OpenBookQA, ARC-Easy, ARC-Challenge), plus PIQA and LAMBADA.
+  * *Long context:* Loss at 1k–16k tokens on **262k** held-out tokens (the prefix of `val.bin`), with plain RoPE and with inference-time NTK scaling ($\text{factor} = \text{context} / 1024$).
+  * *Inference:* Cache footprint, prefill latency, decode throughput (64 tokens), and peak decode memory in `bf16` eager PyTorch on an A100-40GB.
+
+### Models Compared
+
+| Model | Run key | Cache scalars / tok / layer | Cache vs GQA | Params |
+|---|---|---|---|---|
+| GQA (2 KV groups, baseline) | `gqa` | 256 | 100.0% | 48.31M |
+| MQA (1 KV group) | `gqa_g1` | 128 | 50.0% | 47.78M |
+| MLA (DeepSeek-V2, $d_c=128$, DRoPE16, absorbed) | `mla` | 144 | 56.2% | 49.42M |
+| GVA + DRoPE16 (GVA paper's serving design, absorbed) | `gva_drope` | 144 | 56.2% | 48.64M |
+| GVA (ordinary RoPE, cannot absorb) | `gva` | 128 | 50.0% | 48.05M |
+| **GKA (ordinary RoPE, absorbed)** | `gka` | 128 | 50.0% | 48.05M |
+| Shared KV ($K=V$, 1-seed floor) | `sharedkv` | 128 | 50.0% | 47.78M |
+| *Follow-up:* GKA + cross-group V | `gka_xg` | 128 | 50.0% | 48.31M |
+| *Follow-up:* GKA + rotated V | `gka_vrope` | 128 | 50.0% | 48.05M |
+| *Follow-up:* GKA + cross-group + rotated V | `gka_xg_vrope` | 128 | 50.0% | 48.31M |
+
+---
 
 ## Results
 
-Full tables: [`results/results.md`](results/results.md) and [`results/long_context.md`](results/long_context.md).
+All multi-seed numbers are **mean ± sample std** across 3 seeds. Full tables live in [`results/results.md`](results/results.md) and [`results/long_context.md`](results/long_context.md).
 
-### 1. Quality at the trained length (512 context)
+### 1. Quality at the Training Length (1024 tokens)
 
-| Method | Seeds | KV cache vs GQA | Val loss ↓ | Val PPL | 6-task avg acc |
-|---|---|---|---|---|---|
-| GQA (G=2) | 3 | 100% | **4.414 ± 0.003** | **82.6** | 34.91 |
-| GKA, G=4 (ours) | 1 | 100% | 4.475 | 87.8 | 34.79 |
-| GKA + DRoPE16 (ours) | 1 | 56% | 4.449 | 85.5 | 35.08 |
-| GVA + DRoPE16 | 3 | 56% | 4.448 ± 0.006 | 85.5 | 34.75 |
-| MQA (G=1) | 3 | 50% | **4.434 ± 0.009** | 84.2 | 34.74 |
-| GVA, RoPE (no absorb) | 1 | 50% | 4.499 | 89.9 | 34.92 |
-| GKA, RoPE (ours) | 3 | 50% | 4.497 ± 0.016 | 89.7 | 34.80 |
-| Shared KV (K=V) | 1 | 50% | 4.536 | 93.3 | 34.53 |
+| Model | Cache | Val loss ↓ | Δ vs GQA | Val PPL ↓ | LAMBADA acc ↑ | LAMBADA PPL ↓ | 5-task avg (paper) |
+|---|---|---|---|---|---|---|---|
+| GQA (baseline) | 100.0% | **3.4810 ± 0.0025** | — | **32.5 ± 0.1** | **16.5 ± 0.4** | **588 ± 52** | 34.12 ± 0.29 |
+| MLA ($d_c$=128, DRoPE16) | 56.2% | 3.4961 ± 0.0102 | +0.0151 | 33.0 ± 0.3 | 16.3 ± 0.9 | 668 ± 76 | 33.87 ± 0.23 |
+| MQA (GQA, $G$=1) | 50.0% | 3.5068 ± 0.0092 | +0.0259 | 33.3 ± 0.3 | 15.4 ± 1.0 | 692 ± 84 | 34.27 ± 0.51 |
+| GVA + DRoPE16 | 56.2% | 3.5090 ± 0.0115 | +0.0281 | 33.4 ± 0.4 | 15.3 ± 0.1 | 744 ± 36 | 34.02 ± 0.20 |
+| GVA (RoPE, no absorb) | 50.0% | 3.5288 ± 0.0045 | +0.0478 | 34.1 ± 0.2 | 15.2 ± 0.4 | 733 ± 37 | 34.26 ± 0.47 |
+| **GKA (ours, RoPE)** | 50.0% | 3.5420 ± 0.0054 | +0.0610 | 34.5 ± 0.2 | 14.5 ± 0.6 | 810 ± 81 | 33.90 ± 0.17 |
+| Shared KV ($K=V$, 1 seed) | 50.0% | 3.5585 | +0.0775 | 35.1 | 13.9 | 1036 | 33.97 |
 
 ![Final validation loss against KV-cache size](results/figures/quality_vs_cache.png)
 
-* The gaps to GQA (MQA +0.020, GVA+DRoPE +0.035, GKA +0.083) are several times the seed spread, and the ranking holds in every seed.
-* MQA beats every reconstruction method at 50–56% cache. GKA-G4 loses to GQA at an equal cache. At this scale, a shared key that must also carry content is a worse use of cache than a dedicated value stream, which mirrors the GVA paper's own Shared-KV finding.
-* GKA beats Shared KV (4.497 vs 4.536) despite spanning the same function class, so the factorised parameterisation does help optimisation somewhat.
+* **GKA vs. MQA (same 50% cache):** GKA is **0.0352 worse** (~5.7 SE; every single seed of MQA beats every seed of GKA). Separating keys and values into two dedicated 64-dim groups (MQA) beats spending all 128 cached scalars on two key groups and reconstructing values from them.
+* **GKA vs. GVA (RoPE) (same 50% cache, same RoPE):** GKA is **0.0132 worse** (~3.3 SE; consistent across all 3 seeds: `+0.0124`, `+0.0131`, `+0.0142`). Reconstructing values from keys hurts slightly more than reconstructing keys from values, matching the theoretical asymmetry (GKA collapses into $W_O$; GVA with ordinary RoPE does not).
+* **GVA + DRoPE16 vs. GVA (RoPE):** Adding the 16-dim decoupled RoPE slice improves GVA by **0.0197** (~2.8 SE) — at the cost of 12.5% more cache (56.2% vs 50.0%).
+* **MLA, MQA, and GVA + DRoPE16 are statistically close:** MLA has the best mean (`3.4961`), ahead of MQA (`3.5068`) and GVA+DRoPE16 (`3.5090`), but all three have ~0.010 seed std, so the pairwise gaps between them are within ~1.5 SE. All three clearly lag full GQA (`3.4810`, 2.5–4.7 SE).
+* **Zero-shot tasks at 48M scale:** The GVA paper's 5-task average carries no usable signal here — every model sits between `33.86%` and `34.27%`, just above chance and buried in seed noise. **LAMBADA** is the only downstream benchmark that separates models, and it mirrors the validation-loss ranking closely.
 
-### 2. Long context
+---
 
-Held-out loss beyond the training length (3 seeds; ± is the std across seeds):
+### 2. Inference Speed & Memory
 
-**Trained at 512:**
+Measured in `bf16` eager PyTorch on an **NVIDIA A100-SXM4-40GB** (64 decoded tokens, no custom fused kernels):
 
-| Method | Cache | @512 | @2048 plain | @16k plain | @4096 NTK | @16k NTK |
+| Model | Cache MB (B=32, T=4096) | Peak decode MB (B=32, T=4096) | Decode tok/s (B=1, T=4096) | Decode tok/s (B=16, T=4096) | Decode tok/s (B=32, T=4096) | Prefill ms (B=32, T=4096) |
 |---|---|---|---|---|---|---|
-| GQA | 100% | **4.434** | 5.402 ± 0.069 | 6.208 ± 0.037 | 5.135 ± 0.058 | 5.660 ± 0.048 |
-| MQA | 50% | 4.455 | 5.409 ± 0.030 | 6.259 ± 0.051 | 5.056 ± 0.063 | 5.653 ± 0.041 |
-| GVA + DRoPE16 | 56% | 4.468 | 5.550 ± 0.010 | 6.491 ± 0.031 | **4.755 ± 0.024** | 5.538 ± 0.033 |
-| GKA, RoPE (ours) | 50% | 4.515 | **5.097 ± 0.109** | **6.069 ± 0.053** | 4.948 ± 0.078 | **5.507 ± 0.060** |
+| GQA | 512 | 526 | 97 | 1496 | 3003 | 1113 |
+| MQA | 256 | **270** | 96 | 1493 | **3045** | 1106 |
+| MLA | 288 | 311 | 80 | 1240 | 2497 | 1312 |
+| GVA + DRoPE16 | 288 | 302 | 84 | 1272 | 2586 | 1280 |
+| GVA (RoPE, no absorb) | 256 | 644 | 95 | 1168 | 1410 | 1555 |
+| **GKA (ours, RoPE)** | 256 | 328 | **105** | **1596** | 2851 | **1064** |
+| Shared KV | 256 | 324 | 104 | 1590 | 2830 | **1063** |
 
-**Trained at 2048:**
+* **GKA is fastest at B=1, B=16, and prefill** (tied with Shared KV, which executes the same decode path), and within 5% of GQA/MQA at B=32.
+* **Absorption matters hugely at batch 32:** GKA is **2.0× faster** than GVA (RoPE) (`2851` vs `1410 tok/s`) and uses **half the peak decode memory** (`328 MB` vs `644 MB`). Without absorption, GVA (RoPE) materializes all 8 heads' reconstructed keys every step, using *more* peak memory than full GQA (`526 MB`).
+* **On-the-fly key rotation is cheap on A100, costlier on lower-bandwidth GPUs:** Re-rotating cached keys in eager PyTorch adds ~72 MB of temporary buffers at B=32, T=4096 (`328` vs MQA's `270 MB`) and costs ~5% throughput on an A100. On an earlier L4 benchmark (much lower memory bandwidth), the same eager re-rotation cost ~40% at B=32 (`1800` vs GQA `2982 tok/s`). A fused attention kernel applying RoPE in registers would eliminate both the extra memory and bandwidth overhead.
+* **Small-model decode is launch-bound:** At 48M params, halving the KV cache shows up in memory footprint rather than throughput (MQA vs GQA is +1% at B=32). At larger scales where decode is strictly memory-bandwidth-bound, the 2× cache reduction translates directly into speed.
 
-| Method | Cache | @2048 | @4096 plain | @16k plain | @8k NTK | @16k NTK |
+---
+
+### 3. Long-Context Extrapolation (Trained at 1024)
+
+Evaluated on 262k held-out tokens (*the smaller prefix subset explains why `@1024` here is ~0.025 lower than the 3.28M-token validation loss above*):
+
+| Model | plain @1024 | plain @2048 | plain @4096 | NTK @4096 | NTK @8192 | NTK @16384 |
 |---|---|---|---|---|---|---|
-| GQA | 100% | **4.490 ± 0.008** | 5.008 ± 0.031 | 5.931 ± 0.010 | 4.686 ± 0.007 | 4.934 ± 0.035 |
-| GVA + DRoPE16 | 56% | 4.505 ± 0.021 | 5.173 ± 0.001 | 6.538 ± 0.052 | **4.550 ± 0.019** | **4.734 ± 0.022** |
-| MQA | 50% | 4.517 ± 0.027 | 5.126 ± 0.142 | 6.062 ± 0.121 | 4.766 ± 0.122 | 5.024 ± 0.155 |
-| GKA, RoPE (ours) | 50% | 4.641 ± 0.038 | **4.818 ± 0.084** | **5.476 ± 0.118** | 4.727 ± 0.064 | 4.854 ± 0.080 |
+| GQA | **3.456 ± 0.004** | 4.295 ± 0.059 | 5.367 ± 0.064 | 3.961 ± 0.043 | 4.557 ± 0.070 | 5.137 ± 0.077 |
+| MQA | 3.480 ± 0.008 | 4.268 ± 0.186 | 5.478 ± 0.054 | 3.924 ± 0.157 | 4.523 ± 0.191 | 5.130 ± 0.145 |
+| MLA | 3.471 ± 0.010 | 4.414 ± 0.085 | 5.568 ± 0.033 | 3.918 ± 0.064 | 4.520 ± 0.053 | 5.152 ± 0.056 |
+| GVA + DRoPE16 | 3.485 ± 0.011 | 4.685 ± 0.116 | 5.797 ± 0.070 | 4.062 ± 0.110 | 4.698 ± 0.085 | 5.326 ± 0.065 |
+| GVA (RoPE) | 3.504 ± 0.004 | 4.000 ± 0.051 | 5.054 ± 0.049 | **3.768 ± 0.034** | **4.277 ± 0.048** | 4.868 ± 0.045 |
+| **GKA (ours, RoPE)** | 3.518 ± 0.006 | **3.957 ± 0.104** | **4.942 ± 0.076** | 3.802 ± 0.055 | 4.288 ± 0.108 | **4.864 ± 0.088** |
+| Shared KV (1 seed) | 3.534 | 4.395 | 5.364 | 4.189 | 4.748 | 5.282 |
 
 ![Loss by token position, plain vs NTK RoPE](results/figures/long_context.png)
 
-* **GKA degrades least with plain RoPE** from 4× extension onward at both training lengths (and from 2× when trained at 2048). A plausible reason: values are a fixed linear map of keys, so attention outputs cannot drift into unseen directions. This mechanism is not tested here.
-* **GVA+DRoPE with NTK scaling is the strongest long-context setup.** Trained at 512, it is best at 2–16× extension and ties with GKA at 32× (16k). Trained at 2048, it matches GQA at 4096 and beats it at 8k and 16k.
-* **The DRoPE variants are the worst without NTK.** Their 16-dim shared positional slice breaks down outside the trained range, and NTK scaling repairs it.
-* Training at 2048 widens GKA's in-distribution gap to GQA (+0.15 vs +0.08 at 512) but keeps GVA+DRoPE close (+0.015).
+* **Plain GKA and GVA (RoPE) degrade the least beyond 1024.** At plain @2048 they beat GQA by ~0.30–0.34 nats (~5–6 SE), and at NTK @16384 they still lead GQA and MQA by **~0.27 nats** (`4.86` vs `5.13`, ~4–5 SE).
+* **Decoupled RoPE extrapolates worst.** `GVA + DRoPE16` degrades fastest under both plain RoPE (`4.685` at 2k, +0.39 worse than GQA) and NTK scaling (`5.326` at 16k). `MLA` also degrades faster than GQA with plain RoPE (`4.414` at 2k), though NTK brings it back in line with GQA/MQA. Packing all positional signal into a 16-dim slice leaves fewer frequency bands to extrapolate smoothly.
+* **Not simply a parameter-count effect:** Shared KV (`5.282` at NTK @16k) does *not* share GKA's extrapolation advantage, and all three GKA follow-up variants below lose it as well.
+* **Caveat on absolute quality:** Every model breaks down sharply past ~6k–8k tokens even with NTK scaling (rising from ~3.5 to ~4.9–5.3 by 16k). This is "degrades less severely", not usable zero-shot 16k context.
 
-### 3. Inference (RTX 3050 laptop, bf16, PyTorch eager; B=32, T=4096)
+---
 
-| Method | KV cache | decode tok/s | decode peak MB |
-|---|---|---|---|
-| GQA | 512 MB | 3342 | 525 |
-| MQA | 256 MB | 3355 | 270 |
-| GVA + DRoPE16 (absorbed) | 288 MB | 2473 | 328 |
-| GKA + DRoPE16 (absorbed) | 288 MB | 2502 | 332 |
-| GKA, RoPE (absorbed) | 256 MB | 1345 | 328 |
-| GVA, RoPE (no absorb) | 256 MB | 262 | 644 |
+## Follow-up: Can GKA Be Made More Expressive?
 
-At this size, decode speed in eager mode is bound by launch overhead and weight reads, so the halved cache shows up as memory and batch capacity, not tokens/s. GKA (RoPE) is slower at large B×T only because eager mode materialises rotated keys each step; a fused kernel would rotate in registers. Non-absorbable GVA is 13× slower because it rebuilds H keys per step.
+To test whether GKA can escape its $N_h W_O^h$ collapse **without** giving up its 50% cache or absorbed decode, we trained 3 variants (3 seeds each, 9 additional runs):
 
-### 4. GKA vs GVA, head to head
-
-The RoPE setup matters more than whether keys or values are cached, so the fair comparison holds it fixed. All models here were trained at 512 context.
-
-**Ordinary RoPE** (both 50% cache; GVA is 1 seed):
-
-| | GKA | GVA |
+| Variant | Values for head $h$ | Idea |
 |---|---|---|
-| Val loss @512 | 4.497 ± 0.016 | 4.499 |
-| Plain RoPE @2048 / @16k | **5.097 / 6.069** | 5.221 / 6.172 |
-| NTK @4096 / @16k | 4.948 / 5.507 | 4.940 / 5.508 |
-| Decode tok/s (B=32, T=4096) | **1345** | 262 |
-| Decode peak memory | **328 MB** | 644 MB |
+| **`gka_xg`** (cross-group V) | $[k^{(1)}_j, k^{(2)}_j] \, N_h$ | Each head's value reads **both** key groups (128 dims instead of 64). Still absorbs into $W_O$, but lets group 1 heads borrow group 2's cached keys as a separate value subspace (and vice versa). +0.26M params. |
+| **`gka_vrope`** (rotated V) | $\left(k^{(g)}_j R_{j-t}\right) N_h$ | Values use the rotated keys, rotated back by $R_t^\top$ after attention aggregation so $R_{j-t}$ sits between $k_j$ and $N_h$ — breaking the collapse while keeping $N_h$ absorbed into $W_O$. |
+| **`gka_xg_vrope`** (both) | $[k^{(1)}_j, k^{(2)}_j] R_{j-t} \, N_h$ | Combines cross-group values and relative value rotation. |
 
-This is GKA's clear win. GVA with ordinary RoPE cannot absorb M, so it rebuilds every head's keys at each step. GKA absorbs N into W_O and gets the same quality, better plain-RoPE extrapolation, 5× faster decode and half the memory.
+| Model | Val loss ↓ | Δ vs GKA | LAMBADA acc ↑ | plain @2048 | NTK @16384 | Decode tok/s (B=32) | Prefill ms (B=32) |
+|---|---|---|---|---|---|---|---|
+| MQA *(reference, 50% cache)* | 3.5068 ± 0.0092 | −0.0352 | 15.4 ± 1.0 | 4.268 ± 0.186 | 5.130 ± 0.145 | **3045** | 1106 |
+| GVA (RoPE) *(reference, 50% cache)* | 3.5288 ± 0.0045 | −0.0132 | 15.2 ± 0.4 | 4.000 ± 0.051 | 4.868 ± 0.045 | 1410 | 1555 |
+| GKA | 3.5420 ± 0.0054 | — | 14.5 ± 0.6 | **3.957 ± 0.104** | **4.864 ± 0.088** | 2851 | **1064** |
+| **GKA + cross-group V** (`gka_xg`) | **3.5315 ± 0.0056** | **−0.0105** | **15.7 ± 0.5** | 4.128 ± 0.141 | 5.033 ± 0.123 | 2660 | 1109 |
+| GKA + rotated V (`gka_vrope`) | 3.5706 ± 0.0051 | +0.0285 | 13.4 ± 0.3 | 4.215 ± 0.065 | 5.143 ± 0.040 | 2359 | 1361 |
+| GKA + both (`gka_xg_vrope`) | 3.5403 ± 0.0063 | −0.0017 | 14.6 ± 0.3 | 4.339 ± 0.108 | 5.209 ± 0.060 | 2121 | 1421 |
 
-**Decoupled RoPE** (both 56% cache; GKA+DRoPE is 1 seed):
+* **Cross-group values work as intended.** `gka_xg` improves on GKA by **0.0105** (~2.3 SE) and ties GVA (RoPE) (`3.5315` vs `3.5288`, 0.7 SE), while keeping absorption and decoding **1.9× faster** than GVA (RoPE) at batch 32 (only 7% slower than plain GKA). However, it still trails MQA by **0.0247** (~4.0 SE): both key slots must still serve as routing keys for half the heads, whereas MQA dedicates one full slot purely to keys and one purely to values.
+* **Rotated values are a dead end.** `gka_vrope` is **0.0285 worse** than plain GKA (~6.7 SE) and worse than Shared KV (`3.5585`), dropping LAMBADA accuracy to `13.4%`. Multiplying values by $R_{j-t}$ makes a token's value vector spin with distance $j - t$; in the high-frequency RoPE dimensions, identical content points in different directions at every offset and destructively cancels when averaged across positions.
+* **Combining both cancels out.** The cross-group gain and the value-rotation penalty offset each other (`3.5403` ≈ plain GKA `3.5420`), while paying the highest decode and training overhead.
+* **All three lose GKA's long-context advantage.** At NTK @16384 they degrade to `5.03–5.21`, back in line with GQA and MQA.
 
-| | GKA + DRoPE | GVA + DRoPE |
-|---|---|---|
-| Val loss @512 | 4.449 | 4.448 ± 0.006 |
-| Plain RoPE @2048 | 5.510 | 5.550 |
-| NTK @4096 / @16k | 4.728 / 5.485 | 4.755 / 5.538 |
-| Decode tok/s | 2502 | 2473 |
+---
 
-These are effectively identical, as the expressivity argument predicts: with DRoPE both reduce to the same function class.
+## Conclusions & Limitations
 
-**Each method in its own recommended design** (GKA with ordinary RoPE vs GVA+DRoPE): GVA+DRoPE is better at the trained length (4.448 vs 4.497 at 512; 4.505 vs 4.641 at 2048) and with NTK scaling at 2–16× extension. GKA wins by a wide margin with plain RoPE (5.48 vs 6.54 at 16k, trained at 2048) and uses a slightly smaller cache (50% vs 56%).
+1. **Use MQA (or MLA), not GKA, if in-distribution quality is the priority.** At 50% KV cache and 48M / 1B scale, MQA beats GKA by 0.035 val loss and `gka_xg` by 0.025, with simpler implementation and lower peak decode memory.
+2. **GKA's real strengths are architectural simplicity and decode speed.** It is the cleanest way to get an absorbable, 50%-cache reconstructed-KV attention without decoupled RoPE — achieving the fastest prefill and B=1/B=16 decode, 2× GVA (RoPE)'s B=32 throughput, and strong extrapolation robustness.
+3. **`gka_xg` dominates GVA (RoPE).** It matches GVA (RoPE) on quality (`3.5315` vs `3.5288`) while staying absorbable, 1.9× faster at B=32 decode, and using half the peak decode memory.
+4. **Scale caveat:** All runs are at 48M parameters (only ~22M non-embedding, ~5M in attention) and 1B tokens, whereas the GVA paper reports near-GQA parity at 350M parameters and 30B tokens. Rankings — especially between MLA, GVA+DRoPE, MQA, and cross-group GKA — could shift at larger scale.
+5. **Implementation & logging caveats:**
+   * Inference numbers are eager PyTorch without custom fused kernels. During training (`torch.compile`), MLA and GVA+DRoPE run ~28% slower (~58 min vs ~45 min) because their 80-dim $Q/K$ vs 64-dim $V$ misses the fastest FlashAttention path; `gka_xg_vrope` runs ~47% slower (~66 min) due to 128-dim values. These are kernel/implementation effects, not fundamental FLOP costs.
+   * Shared KV is a single-seed reference floor (`seed=1337`).
+   * `mla_s1` and `gva_drope_s2` resumed cleanly from checkpoints after Colab disconnects (at steps 5500 and 6000 respectively); their final metrics are unaffected, though their `log.jsonl` files begin at the resume step.
 
-**Verdict:** caching keys versus values makes no difference to quality; under the same RoPE setup GKA ties GVA and never loses. GKA's advantage is structural: it absorbs with ordinary RoPE, so it needs no decoupled slice. That gives it the smallest absorbable cache and the most robust plain-RoPE extrapolation. GVA+DRoPE's edge in-distribution comes from DRoPE, not from caching values, because GKA+DRoPE matches it.
+---
 
-### Caveats
+## Repository Layout
 
-* The models are tiny: 48M params and 40M tokens, about 0.1× Chinchilla. The GVA paper's near-parity claims are at 350M/30B, and rankings may change at scale.
-* GKA+DRoPE, GKA-G4, GVA (RoPE) and Shared KV are single runs, so differences under ~0.02 involving them are within noise. Neither GKA+DRoPE nor GVA (RoPE) was trained at 2048 context, so the like-for-like GKA vs GVA comparison covers 512-trained models only.
-* Throughput numbers come from naive eager code on a laptop GPU. Cache and memory numbers are reliable.
-
-## Repository layout
-
-```
-gka/                      the library
-  model.py                  all attention variants + absorbed cached decode paths, NTK RoPE scaling
-  runs.py                   run naming (gka_g4, gka_s7, gka_c2048_s1, ...) and checkpoint loading
-  style.py                  model labels and plot colours
-  paths.py                  data/, runs/, results/, logs/ locations
+```text
+gka/
+  model.py                     All 10 attention variants, absorbed cached decode paths, NTK RoPE scaling
+  zclip.py                     ZClip adaptive gradient clipping
+  runs.py                      Run naming (gka_s1, gqa_g1_s2, ...), experiment lists, checkpoint loading
+  paths.py, style.py           Directory paths (env-var overridable) and plot styles
 scripts/
-  prepare_data.py           stream + tokenize FineWeb-Edu -> data/{train,val}.bin
-  train.py                  train one run -> runs/<name>/
-  evaluate.py               zero-shot benchmarks -> runs/<name>/benchmarks.json
-  bench_inference.py        cache size / prefill / decode speed -> results/inference.json
-  bench_train_throughput.py training tok/s and memory per variant
-  analyze.py                -> results/results.md, results/figures/
-  eval_long_context.py      loss at 512-16k context, plain vs NTK RoPE -> runs/<name>/long_context.json
-  analyze_long_context.py   -> results/long_context.md, results/figures/long_context.png
-  run_all.ps1, run_all.sh   experiment 1 end to end, resumable
-tests/test_model.py       decode == forward for every variant, cache sizes, run names, RoPE scaling
-runs/<name>/              log.jsonl, summary.json, benchmarks.json, long_context.json
-results/                  results.md, long_context.md, inference.json, figures/
+  colab.sh                     End-to-end resumable pipeline for Colab A100
+  prepare_data.py              Tokenize FineWeb-Edu -> data/{train,val}.bin
+  train.py                     Resumable training script -> runs/<name>/
+  evaluate.py                  Zero-shot benchmarks (5 paper tasks + PIQA + LAMBADA)
+  eval_long_context.py         1k-16k plain and NTK-scaled RoPE evaluation
+  bench_inference.py           KV cache footprint, prefill/decode speed, peak memory -> results/inference.json
+  bench_train_throughput.py    Training throughput and Colab CU projections
+  analyze.py                   Aggregates runs/ and inference.json -> results/results.md + figures
+  analyze_long_context.py      Aggregates long-context evals -> results/long_context.md + figure
+tests/
+  test_model.py                Verifies absorbed decode == forward, cache sizes, init scale, ZClip, run names
+runs/<name>/                   summary.json, log.jsonl, benchmarks.json, long_context.json
+results/                       results.md, long_context.md, inference.json, figures/
 ```
 
-Not in git: `data/` (regenerate with `prepare_data.py`), `logs/`, and `runs/*/model.pt` checkpoints (~190 MB each).
+Excluded from git: `data/`, `logs/`, and `runs/*/model.pt` weights.
 
-## Reproduce
+---
 
-Requires [uv](https://docs.astral.sh/uv/) and an NVIDIA GPU (the lockfile pins PyTorch for CUDA 12.8). A 512-context run takes about 40 min on an RTX 3050 laptop or about 4 min on an A100.
+## Reproducing the Results
+
+Requires [uv](https://docs.astral.sh/uv/) and an NVIDIA GPU (`uv.lock` pins PyTorch for CUDA 12.8). On a Colab A100-40GB, a standard 1B-token run takes ~45 min (~58 min for MLA and GVA+DRoPE, ~66 min for `gka_xg_vrope`). Training all 28 runs takes ~23.5 GPU-hours (~158 Colab compute units for training; ~170 CU including evals and benchmarks).
+
+### On Google Colab (A100)
+
+Mount Google Drive first, then run each stage (all stages skip completed runs and resume cleanly after disconnects):
+
+```bash
+git clone -b from-scratch https://github.com/ojasinha/gka.git /content/gka
+bash /content/gka/scripts/colab.sh setup     # install deps + tokenize/cache data on Drive
+bash /content/gka/scripts/colab.sh train     # train all 28 runs (re-run to resume)
+bash /content/gka/scripts/colab.sh eval      # zero-shot + long-context evals
+bash /content/gka/scripts/colab.sh bench     # inference benchmark
+bash /content/gka/scripts/colab.sh analyze   # regenerate tables and figures
+```
+
+### Locally
 
 ```bash
 uv sync
-uv run pytest                                    # decode-path equivalence tests
-
-# Experiment 1 (all 8 variants at 512 context), end to end, resumable:
-bash scripts/run_all.sh                          # or: powershell -File scripts/run_all.ps1
-# extra seeds:
-uv run python scripts/train.py --attn gka --seed 1                      # -> runs/gka_s1
-
-# Experiment 2 (2048-context training + long-context eval):
-uv run python scripts/train.py --attn gka --seq_len 2048 --micro_bs 8 --accum 1   # -> runs/gka_c2048
-uv run python scripts/eval_long_context.py --ntk --runs gka gka_c2048
-uv run python scripts/analyze_long_context.py
-
-# Experiment 3:
-uv run python scripts/bench_inference.py
+uv run pytest
+uv run python scripts/prepare_data.py
+uv run python scripts/train.py --run gka_s1 --compile   # --compile requires Linux (Triton)
 uv run python scripts/analyze.py
+uv run python scripts/analyze_long_context.py
 ```

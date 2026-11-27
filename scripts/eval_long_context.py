@@ -46,17 +46,20 @@ def eval_context(model, val, ctx, n_tokens, bucket):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--runs", nargs="+", default=DEFAULT_RUNS, help="run names, e.g. gqa gka gka_c2048_s1")
-    p.add_argument("--contexts", default="512,1024,2048,4096,8192,16384")
+    p.add_argument("--runs", nargs="+", default=DEFAULT_RUNS, help="run names, e.g. gqa gka gka_s1")
+    p.add_argument("--contexts", default="1024,2048,4096,8192,16384")
     p.add_argument("--ntk", action="store_true", help="also evaluate NTK RoPE scaling beyond the training length")
     p.add_argument("--tokens", type=int, default=262_144, help="held-out tokens per context length")
     p.add_argument("--bucket", type=int, default=256, help="position bucket size for the loss-vs-position curve")
+    p.add_argument("--skip_done", action="store_true", help="skip runs that already have long_context.json")
     args = p.parse_args()
     val = np.memmap(DATA_DIR / "val.bin", dtype=np.uint16, mode="r")
     contexts = [int(c) for c in args.contexts.split(",")]
     assert max(contexts) * max(1, args.tokens // max(contexts)) < len(val), "not enough held-out tokens"
 
     for run in args.runs:
+        if args.skip_done and (run_dir(run) / "long_context.json").exists():
+            continue
         model = load_model(run, DEV)
         train_len = model.cfg.seq_len
         out = {"train_len": train_len, "plain": {}, "ntk": {}}

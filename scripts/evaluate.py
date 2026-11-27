@@ -1,9 +1,12 @@
 """Zero-shot evaluation of trained checkpoints (lm-eval-harness conventions).
 
-Tasks: HellaSwag, ARC-Easy, ARC-Challenge, OpenBookQA, PIQA, WinoGrande (partial scoring),
-LAMBADA (last-word accuracy + perplexity), and FineWeb-Edu held-out perplexity at context
-512 (training length) plus 1024/2048 (length extrapolation).
+Headline metric: the GVA paper's 5-task average (HellaSwag, WinoGrande, OpenBookQA, ARC-Easy,
+ARC-Challenge), unweighted mean of the per-task accuracies. HellaSwag/ARC/OBQA use length-normalised
+accuracy (acc_norm), WinoGrande uses partial scoring. PIQA and LAMBADA are also recorded as extras.
+Held-out loss at and beyond the training length is measured by eval_long_context.py.
 """
+
+PAPER_TASKS = ["hellaswag", "winogrande", "openbookqa", "arc_easy", "arc_challenge"]
 
 import argparse
 import json
@@ -17,7 +20,6 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 
-from gka.paths import DATA_DIR
 from gka.runs import DEFAULT_RUNS, load_model, run_dir
 
 enc = tiktoken.get_encoding("gpt2")
@@ -27,8 +29,9 @@ DEV = "cuda"
 # ----------------------------------------------------------------------------- scoring
 
 @torch.no_grad()
-def score_pairs(model, pairs, bs=32, max_len=512):
+def score_pairs(model, pairs, bs=32):
     """pairs: list of (context, continuation). Returns (sum logprob, all-greedy) per pair."""
+    max_len = model.cfg.seq_len
     toks = []
     for ctx, cont in pairs:
         c = enc.encode_ordinary(ctx) if ctx else [enc.eot_token]
@@ -122,33 +125,19 @@ def eval_lambada(model, items):
     return sum(r[1] for r in res) / len(res), math.exp(nll / len(res))
 
 
-@torch.no_grad()
-def val_ppl(model, ctx, n_tokens=1_048_576):
-    val = np.memmap(DATA_DIR / "val.bin", dtype=np.uint16, mode="r")
-    bs = max(1, 8 * 512 // ctx)
-    n_seq = n_tokens // ctx
-    tot, cnt = 0.0, 0
-    # also track the loss on the final 256 positions (where extrapolation bites)
-    tail, tcnt = 0.0, 0
-    for s in range(0, n_seq, bs):
-        b = min(bs, n_seq - s)
-        x = torch.from_numpy(np.stack([val[(s + i) * ctx : (s + i) * ctx + ctx + 1] for i in range(b)]).astype(np.int64)).to(DEV)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            logits, _ = model(x[:, :-1])
-        l = F.cross_entropy(logits.float().transpose(1, 2), x[:, 1:], reduction="none")
-        tot += l.sum().item()
-        cnt += l.numel()
-        tail += l[:, -256:].sum().item()
-        tcnt += l[:, -256:].numel()
-    return tot / cnt, tail / tcnt
+def headline(r):
+    """The paper's 5-task average, in %."""
+    return 100 * sum(r[t]["acc_norm" if "acc_norm" in r[t] else "acc"] for t in PAPER_TASKS) / len(PAPER_TASKS)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--runs", nargs="+", default=DEFAULT_RUNS, help="run names, e.g. gqa gka gka_g4")
+    p.add_argument("--runs", nargs="+", default=DEFAULT_RUNS, help="run names, e.g. gqa gka gka_s1")
+    p.add_argument("--skip_done", action="store_true", help="skip runs that already have benchmarks.json")
     args = p.parse_args()
-    tasks = build_tasks()
-    for run in args.runs:
+    runs = [r for r in args.runs if not (args.skip_done and (run_dir(r) / "benchmarks.json").exists())]
+    tasks = build_tasks() if runs else {}
+    for run in runs:
         model = load_model(run, DEV)
         r = {}
         for t in ["hellaswag", "arc_easy", "arc_challenge", "openbookqa", "piqa"]:
@@ -158,10 +147,8 @@ if __name__ == "__main__":
         r["winogrande"] = {"acc": eval_winogrande(model, tasks["winogrande"])}
         acc, ppl = eval_lambada(model, tasks["lambada"])
         r["lambada"] = {"acc": acc, "ppl": ppl}
-        for ctx in [512, 1024, 2048]:
-            loss, tail = val_ppl(model, ctx)
-            r[f"val_ctx{ctx}"] = {"loss": loss, "ppl": math.exp(loss), "tail256_loss": tail}
-        print(run, json.dumps(r), flush=True)
+        r["avg5"] = headline(r)
+        print(run, f"5-task avg {r['avg5']:.2f}", json.dumps(r), flush=True)
         json.dump(r, open(run_dir(run) / "benchmarks.json", "w"), indent=2)
         del model
         torch.cuda.empty_cache()

@@ -4,7 +4,7 @@ A run is named after its attention variant, with suffixes for non-default settin
   gka         -> attn=gka, n_group=2, seed=1337
   gka_g4      -> attn=gka, n_group=4
   gka_g4_s7   -> attn=gka, n_group=4, seed=7
-  gka_c2048   -> attn=gka, trained with seq_len=2048
+  gka_c2048   -> attn=gka, trained with seq_len=2048 (default is 1024)
 """
 
 import re
@@ -18,9 +18,6 @@ from .paths import RUNS_DIR
 DEFAULT_N_GROUP = Config.n_group
 DEFAULT_SEED = 1337
 DEFAULT_SEQ_LEN = Config.seq_len
-
-# The eight runs reported in the README (all six variants + two equal-cache controls).
-DEFAULT_RUNS = VARIANTS + ["gqa_g1", "gka_g4"]
 
 _NAME = re.compile(rf"^({'|'.join(sorted(VARIANTS, key=len, reverse=True))})(?:_g(\d+))?(?:_c(\d+))?(?:_s(\d+))?$")
 
@@ -60,3 +57,28 @@ def load_model(name: str, device="cuda", allow_random_init=False) -> GPT:
     else:
         raise FileNotFoundError(f"{path} not found; train it with scripts/train.py first")
     return model.eval()
+
+
+# ----------------------------------------------------------------------------- the experiment (PLAN.md)
+# Model keys are run names at the default seed; gqa_g1 is MQA.
+CORE_MODELS = ["gqa", "gqa_g1", "mla", "gva_drope", "gva", "gka"]  # 3 seeds each
+SEEDS = [DEFAULT_SEED, 1, 2]
+REFERENCE_MODELS = ["sharedkv"]  # 1 seed, a reference floor as in the GVA paper
+OPTIONAL_MODELS = ["gka_g4"]  # 1 seed, only if compute is left
+# Follow-up: can GKA escape its Shared-KV function class? (cross-group values, rotated values, both)
+GKA_VARIANT_MODELS = ["gka_xg", "gka_vrope", "gka_xg_vrope"]  # 3 seeds each
+
+# One run per model at the default seed (inference benchmark: speed does not depend on the seed).
+MODELS = CORE_MODELS + REFERENCE_MODELS + GKA_VARIANT_MODELS
+
+
+def with_seed(model: str, seed: int) -> str:
+    """'gqa_g1', 1 -> 'gqa_g1_s1'."""
+    return run_name(**{**parse_run_name(model), "seed": seed})
+
+
+# Every run, seed-major within each experiment, so that a partial budget still gives complete seeds:
+# the main experiment (19 runs), then the GKA follow-up (9 runs).
+MAIN_RUNS = [with_seed(m, s) for s in SEEDS for m in CORE_MODELS] + REFERENCE_MODELS
+GKA_VARIANT_RUNS = [with_seed(m, s) for s in SEEDS for m in GKA_VARIANT_MODELS]
+DEFAULT_RUNS = MAIN_RUNS + GKA_VARIANT_RUNS
